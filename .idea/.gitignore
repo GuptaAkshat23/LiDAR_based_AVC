@@ -1,0 +1,19 @@
+# virtualenvs
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# PyCharm
+.idea/
+*.iml
+
+# OS
+.DS_Store
+
+# large point-cloud files (ignore these)
+*.pcd
