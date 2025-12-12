@@ -1,112 +1,118 @@
-import matplotlib.pyplot as plt
+import open3d as o3d
+import numpy as np
+import glob
 import os
 import tkinter as tk
 from tkinter import filedialog
 
 
-# ==========================================
-# FILE SELECTION GUI
-# ==========================================
-def select_file():
-    """Opens a system file explorer to pick a .pcd file."""
-    # Create a hidden root window for the dialog
-    root = tk.Tk()
-    root.withdraw()
+class LZRU921Viewer:
+    def __init__(self):
+        # 1. Pick a file to start
+        selected_path = self.pick_file()
+        if not selected_path:
+            return
 
-    # Set default directory to './scans' if it exists, otherwise current folder
-    start_dir = "./scans" if os.path.exists("./scans") else "."
+        # 2. Find all other PCD files in that directory
+        directory = os.path.dirname(selected_path)
+        # Assuming your files are named like 'lzr_scan_...'
+        search_pattern = os.path.join(directory, "*.pcd")
+        self.files = sorted(glob.glob(search_pattern))
 
-    print("Opening file selector...")
-    file_path = filedialog.askopenfilename(
-        title="Select a LZR-U921 Scan File",
-        initialdir=start_dir,
-        filetypes=[("PCD Files", "*.pcd"), ("All Files", "*.*")]
-    )
+        if not self.files:
+            print("❌ No files found.")
+            return
 
-    if not file_path:
-        print("No file selected. Exiting.")
-        return None
+        # Normalize paths for cross-platform safety
+        selected_path = os.path.normpath(selected_path)
+        self.files = [os.path.normpath(f) for f in self.files]
 
-    return file_path
+        # Find index of selected file
+        try:
+            self.index = self.files.index(selected_path)
+        except ValueError:
+            self.index = 0
 
+        print(f"📂 Visualizing: {os.path.basename(self.files[self.index])}")
 
-# ==========================================
-# PCD PARSING LOGIC
-# ==========================================
-def read_pcd_data(filename):
-    """Reads X and Y coordinates from a standard ASCII PCD file."""
-    x_points = []
-    y_points = []
+        # 3. Setup Open3D Window
+        self.vis = o3d.visualization.VisualizerWithKeyCallback()
+        self.vis.create_window(window_name="LZR-U921 Viewer", width=1024, height=768)
 
-    try:
-        with open(filename, 'r') as f:
-            lines = f.readlines()
+        # 4. Visual Styling (Matches your request)
+        opt = self.vis.get_render_option()
+        opt.background_color = np.asarray([0, 0, 0])  # PURE BLACK
+        opt.point_size = 3.0  # Slightly larger for LZR visibility
+        opt.show_coordinate_frame = False
 
-            # Locate the start of the data
-            data_start_index = 0
-            for i, line in enumerate(lines):
-                if line.strip().startswith("DATA ascii"):
-                    data_start_index = i + 1
-                    break
+        # 5. Load the first point cloud
+        self.pcd = o3d.io.read_point_cloud(self.files[self.index])
+        self.style_pcd(self.pcd)
+        self.vis.add_geometry(self.pcd)
 
-            # Parse coordinates
-            for i in range(data_start_index, len(lines)):
-                parts = lines[i].strip().split()
-                # Ensure we have at least X and Y
-                if len(parts) >= 2:
-                    try:
-                        x = float(parts[0])
-                        y = float(parts[1])
+        # Add a small red sphere at (0,0,0) to represent the sensor itself
+        self.origin = o3d.geometry.TriangleMesh.create_sphere(radius=0.05)
+        self.origin.paint_uniform_color([1, 0, 0])  # Red
+        self.vis.add_geometry(self.origin)
 
-                        # Filter out 0,0 points (often sensor errors or max range)
-                        if not (x == 0.0 and y == 0.0):
-                            x_points.append(x)
-                            y_points.append(y)
-                    except ValueError:
-                        continue
+        # 6. Bind Keys
+        self.vis.register_key_callback(262, self.load_next)  # Right Arrow
+        self.vis.register_key_callback(263, self.load_prev)  # Left Arrow
 
-        return x_points, y_points
-    except Exception as e:
-        print(f"Error reading file: {e}")
-        return [], []
+        print("Controls: Left/Right Arrow to switch files. Mouse to Rotate/Zoom.")
 
+        # 7. Set initial view to Top-Down (Helpful for 2D Lidar)
+        ctr = self.vis.get_view_control()
+        ctr.set_zoom(0.8)
 
-# ==========================================
-# PLOTTING LOGIC
-# ==========================================
-def visualize_scan(filename):
-    x, y = read_pcd_data(filename)
+        self.vis.run()
+        self.vis.destroy_window()
 
-    if not x:
-        print("File is empty or could not be read.")
-        return
+    def pick_file(self):
+        root = tk.Tk()
+        root.withdraw()
+        file_path = filedialog.askopenfilename(
+            title="Select a LZR-U921 Scan",
+            filetypes=[("Point Cloud Data", "*.pcd")]
+        )
+        return file_path
 
-    # Create the Plot
-    plt.figure(figsize=(10, 8))
+    def style_pcd(self, pcd):
+        # LZR U921 specific styling (Cyan/Aqua for high contrast on black)
+        pcd.paint_uniform_color([0, 1, 1])
 
-    # 1. Plot the Scan Points (Blue Dots)
-    plt.plot(x, y, 'bo', markersize=3, label='Lidar Return')
+    def update_geometry(self):
+        new_file = self.files[self.index]
+        print(f"-> {os.path.basename(new_file)}")
 
-    # 2. Plot the Sensor Location (Red X at 0,0)
-    plt.plot(0, 0, 'rx', markersize=12, markeredgewidth=3, label='LZR U921 Sensor')
+        new_pcd = o3d.io.read_point_cloud(new_file)
+        self.style_pcd(new_pcd)
 
-    # Formatting
-    plt.title(f"Scan View: {os.path.basename(filename)}")
-    plt.xlabel("X Distance (meters) - [Left/Right]")
-    plt.ylabel("Y Distance (meters) - [Forward]")
-    plt.legend()
-    plt.grid(True, linestyle='--', alpha=0.6)
-    plt.axis('equal')  # Critical: Keeps the aspect ratio 1:1
+        # CRITICAL FIX:
+        # We must remove the old geometry and add the new one.
+        # Just updating .colors or .points is risky if point counts differ
+        # (e.g. if one scan filtered out errors and has 270 points vs 274).
+        self.vis.remove_geometry(self.pcd, reset_bounding_box=False)
+        self.pcd = new_pcd
+        self.vis.add_geometry(self.pcd, reset_bounding_box=False)
 
-    # Show
-    print(f"Displaying {len(x)} points...")
-    plt.show()
+        self.vis.poll_events()
+        self.vis.update_renderer()
+
+    def load_next(self, vis):
+        if self.index < len(self.files) - 1:
+            self.index += 1
+            self.update_geometry()
+        else:
+            print("End of sequence.")
+
+    def load_prev(self, vis):
+        if self.index > 0:
+            self.index -= 1
+            self.update_geometry()
+        else:
+            print("Start of sequence.")
 
 
 if __name__ == "__main__":
-    # 1. Ask user to pick a file
-    target_file = select_file()
-
-    # 2. If they picked one, show it
-    if target_file:
-        visualize_scan(target_file)
+    LZRU921Viewer()

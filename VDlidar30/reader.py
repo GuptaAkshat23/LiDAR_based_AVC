@@ -4,16 +4,12 @@ import time
 import struct
 
 
-# --- CONFIGURATION ---
-PORT = 'COM3'  # Check Device Manager (likely COM5 based on past chats)
-BAUD = 512000  # YDLIDAR TG30 Standard
-DURATION = 15.0  # Record for 15 seconds
-# HAND SCANNING SPEED:
-# If you move the sensor 10cm every second, set this to 0.1
-SCAN_SPEED = 0.05  # 0.05 meters/sec (5 cm/sec) - Move SLOWLY!
+PORT = 'COM3'
+BAUD = 512000
+DURATION = 15.0
+SCAN_SPEED = 0.05
 
 
-# ---------------------
 
 def save_3d_pcd(points, filename):
     header = f"""# .PCD v0.7 - Point Cloud Data file format
