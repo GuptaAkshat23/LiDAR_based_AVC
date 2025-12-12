@@ -5,9 +5,7 @@ import datetime
 import binascii
 import os
 
-# ==========================================
-# CONFIGURATION SETTINGS
-# ==========================================
+
 SERIAL_PORT = 'COM3'  # Change to your port (e.g., '/dev/ttyUSB0' on Linux)
 BAUD_RATE = 460800  # Standard LZR U921 baud rate
 POINTS_PER_SCAN = 274  # Standard LZR resolution

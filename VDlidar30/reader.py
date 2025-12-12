@@ -3,15 +3,18 @@ import math
 import time
 import struct
 
-
-PORT = 'COM3'
-BAUD = 512000
-DURATION = 15.0
-SCAN_SPEED = 0.05
+# --- CONFIGURATION ---
+PORT = 'COM3'  # CHANGE THIS to your actual port (from Device Manager)
+BAUD = 512000  # YDLIDAR TG30 Standard
 
 
+# ---------------------
 
-def save_3d_pcd(points, filename):
+def save_pcd(points, filename):
+    # Only save if we have a decent amount of data (e.g., > 100 points)
+    if len(points) < 50:
+        return
+
     header = f"""# .PCD v0.7 - Point Cloud Data file format
 VERSION 0.7
 FIELDS x y z
@@ -27,13 +30,12 @@ DATA ascii
     with open(filename, 'w') as f:
         f.write(header)
         for p in points:
-            # Save X, Y, Z (Space separated)
-            f.write(f"{p[0]:.4f} {p[1]:.4f} {p[2]:.4f}\n")
-    print(f"✅ Saved 3D Model: {filename} ({len(points)} points)")
+            f.write(f"{p[0]:.3f} {p[1]:.3f} 0.000\n")
+    print(f"✅ Saved Full Scan: {filename} ({len(points)} points)")
 
 
 def parse_packet(packet):
-    """Decodes packet to list of (angle, dist_meters)"""
+    """Decodes a single packet and returns a list of (angle, x, y) tuples"""
     try:
         lsn = packet[3]
         if lsn <= 0: return []
@@ -46,18 +48,28 @@ def parse_packet(packet):
 
         diff = angle_lsa - angle_fsa
         if diff < 0: diff += 360
+
         angle_step = diff / (lsn - 1) if lsn > 1 else 0
 
-        raw_data = []
+        parsed_points = []
+
         for i in range(lsn):
             idx = 10 + (2 * i)
-            dist_val = struct.unpack('<H', packet[idx:idx + 2])[0]
-            dist_m = dist_val / 4000.0  # TG30 Unit Conversion
+            dist_data = struct.unpack('<H', packet[idx:idx + 2])[0]
+            distance = dist_data / 4.0
 
-            if dist_m > 0:
+            if distance > 0:
                 current_angle = angle_fsa + (angle_step * i)
-                raw_data.append((current_angle, dist_m))
-        return raw_data
+                angle_rad = math.radians(current_angle)
+
+                # Convert to Meters
+                x = (distance / 1000.0) * math.cos(angle_rad)
+                y = (distance / 1000.0) * math.sin(angle_rad)
+
+                # Return Angle too, so we can detect "Wrap Around"
+                parsed_points.append((current_angle, x, y))
+
+        return parsed_points
     except:
         return []
 
@@ -66,66 +78,55 @@ def parse_packet(packet):
 try:
     ser = serial.Serial(PORT, BAUD, timeout=1)
 
-    # Wake Up
+    # 1. Wake Up
     ser.setDTR(True)
     ser.write(b'\xA5\x60')
     time.sleep(0.5)
     ser.reset_input_buffer()
 
-    print(f"🎥 STARTING 3D SCAN ({DURATION}s)...")
-    print(f"👉 INSTRUCTION: Move the LiDAR steadily UPWARDS or FORWARD at {SCAN_SPEED * 100} cm/s")
+    print(f"🚀 Collecting Full 360° Scans on {PORT}...")
 
     buffer = b''
-    fused_cloud = []
+    current_scan_points = []
+    previous_angle = 0.0
 
-    start_time = time.time()
-
-    while (time.time() - start_time) < DURATION:
+    while True:
         if ser.in_waiting:
             buffer += ser.read(ser.in_waiting)
 
+            # Process all valid packets in the buffer
             while len(buffer) > 10:
                 if buffer[0] == 0xAA and buffer[1] == 0x55:
                     lsn = buffer[3]
                     packet_len = 10 + (2 * lsn)
 
                     if len(buffer) < packet_len:
-                        break
+                        break  # Wait for more data
 
                     packet = buffer[:packet_len]
                     buffer = buffer[packet_len:]
 
-                    # 1. Get raw 2D slice
-                    slice_data = parse_packet(packet)
+                    # Parse the packet
+                    new_data = parse_packet(packet)
 
-                    # 2. Calculate "Z-Shift" (or X-Shift) based on Time
-                    # This turns time into a dimension
-                    elapsed = time.time() - start_time
-                    shift_amount = elapsed * SCAN_SPEED
+                    for (angle, x, y) in new_data:
+                        # --- ROTATION LOGIC ---
+                        # If angle jumps from High (350) to Low (10), we finished a circle
+                        if angle < previous_angle and previous_angle > 300 and angle < 50:
+                            # SAVE THE FULL CIRCLE
+                            timestamp = time.strftime("%H%M%S")
+                            save_pcd(current_scan_points, f"scan_full_{timestamp}.pcd")
+                            current_scan_points = []  # Reset for next circle
 
-                    for (angle_deg, r) in slice_data:
-                        angle_rad = math.radians(angle_deg)
+                        # Add point to current buffer
+                        current_scan_points.append((x, y))
+                        previous_angle = angle
 
-                        # --- COORDINATE MAPPING ---
-                        # Imagine the LiDAR is flat on a table (X, Y are the circle)
-                        # We are lifting it UP (Z-axis)
-
-                        x = r * math.cos(angle_rad)
-                        y = r * math.sin(angle_rad)
-                        z = shift_amount  # The vertical movement
-
-                        fused_cloud.append((x, y, z))
                 else:
-                    buffer = buffer[1:]
-
-    print("🛑 Scan Complete.")
-    ser.write(b'\xA5\x65')
-    ser.close()
-
-    # Save file
-    filename = f"object_scan_{int(time.time())}.pcd"
-    save_3d_pcd(fused_cloud, filename)
+                    buffer = buffer[1:]  # Skip garbage bytes
 
 except KeyboardInterrupt:
-    print("Aborted.")
-    if 'ser' in locals(): ser.close()
+    if 'ser' in locals():
+        ser.write(b'\xA5\x65')
+        ser.close()
+    print("Stopped.")
