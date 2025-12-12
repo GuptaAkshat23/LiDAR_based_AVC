@@ -3,6 +3,7 @@ import math
 import time
 import struct
 
+
 # --- CONFIGURATION ---
 PORT = 'COM3'  # Check Device Manager (likely COM5 based on past chats)
 BAUD = 512000  # YDLIDAR TG30 Standard

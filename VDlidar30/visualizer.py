@@ -6,6 +6,7 @@ import tkinter as tk
 from tkinter import filedialog
 
 
+
 class MinimalLiDARViewer:
     def __init__(self):
         # 1. Select a file first to identify the correct folder
