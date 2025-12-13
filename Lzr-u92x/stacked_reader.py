@@ -7,7 +7,7 @@ import sys
 from serial import SerialException
 
 # --- CONFIGURATION ---
-PORT = 'COM3'  # Check Device Manager!
+PORT = 'COM4'  # Check Device Manager!
 BAUD = 460800  # Standard LZR-U921 Speed
 SCAN_SPEED = 0.05  # Speed of movement (meters/second). 0.05 = 5 cm/s (Slow hand lift)
 
