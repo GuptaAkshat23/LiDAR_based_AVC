@@ -17,7 +17,7 @@ SCAN_SPEED = 0.05  # Speed of movement (meters/second). 0.05 = 5 cm/s (Slow hand
 def save_final_pcd(points, filename):
     """Writes the accumulated 3D points to a single file"""
     if len(points) == 0:
-        print("⚠️ No data collected. File not saved.")
+        print("⚠️ No  data collected. File not saved.")
         return
 
     print(f"\n💾 Saving {len(points)} points to '{filename}'...")
