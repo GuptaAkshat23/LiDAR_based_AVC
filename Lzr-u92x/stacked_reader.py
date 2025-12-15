@@ -1,172 +1,172 @@
 import serial
-import math
 import time
-import struct
+import numpy as np
+import datetime
+import os
+import signal
 import sys
 
-from serial import SerialException
+# ==========================================
+# CONFIGURATION
+# ==========================================
+SERIAL_PORT = 'COM4'  # Change to your port
+BAUD_RATE = 460800  # Standard LZR U921 baud rate
+POINTS_PER_SCAN = 274  # Standard LZR resolution
+FOV_DEGREES = 96.0  # Field of View
+SAVE_DIRECTORY = "./scans"  # Folder where files will be saved
 
-# --- CONFIGURATION ---
-PORT = 'COM4'  # Check Device Manager!
-BAUD = 460800  # Standard LZR-U921 Speed
-SCAN_SPEED = 0.05  # Speed of movement (meters/second). 0.05 = 5 cm/s (Slow hand lift)
+# 3D VISUALIZATION SETTINGS
+# How much to move the Z-axis for every scan frame (simulating movement)
+# 0.05 = 5cm per scan. Adjust this based on how fast you move the sensor.
+Z_INCREMENT_METERS = 0.05
+
+# Global buffer to hold all points until we save
+all_points_buffer = []
+scan_counter = 0
 
 
-# ---------------------
-
-def save_final_pcd(points, filename):
-    """Writes the accumulated 3D points to a single file"""
-    if len(points) == 0:
-        print("⚠️ No  data collected. File not saved.")
+# ==========================================
+# PCD SAVING FUNCTION (COMBINED)
+# ==========================================
+def save_combined_pcd(points_list, output_folder):
+    """
+    Saves the accumulated list of (x, y, z) points into a single PCD file.
+    """
+    if not points_list:
+        print("[WARNING] No points to save.")
         return
 
-    print(f"\n💾 Saving {len(points)} points to '{filename}'...")
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
 
-    header = f"""# .PCD v0.7 - LZR 3D Scan
-VERSION 0.7
-FIELDS x y z
-SIZE 4 4 4
-TYPE F F F
-COUNT 1 1 1
-WIDTH {len(points)}
-HEIGHT 1
-VIEWPOINT 0 0 0 1 0 0 0
-POINTS {len(points)}
-DATA ascii
-"""
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = os.path.join(output_folder, f"lzr_combined_3d_{timestamp}.pcd")
+
+    num_points = len(points_list)
+
+    print(f"\n[SAVING] Writing {num_points} points to {filename}...")
+
+    with open(filename, 'w') as f:
+        # PCD Header
+        f.write("# .PCD v.7 - LZR U921 Combined 3D Scan\n")
+        f.write("VERSION .7\n")
+        f.write("FIELDS x y z\n")
+        f.write("SIZE 4 4 4\n")
+        f.write("TYPE F F F\n")
+        f.write("COUNT 1 1 1\n")
+        f.write(f"WIDTH {num_points}\n")
+        f.write("HEIGHT 1\n")
+        f.write("VIEWPOINT 0 0 0 1 0 0 0\n")
+        f.write(f"POINTS {num_points}\n")
+        f.write("DATA ascii\n")
+
+        # PCD Data
+        for p in points_list:
+            f.write(f"{p[0]:.4f} {p[1]:.4f} {p[2]:.4f}\n")
+
+    print(f"[COMPLETE] File saved successfully.")
+
+
+# ==========================================
+# PROCESSING FUNCTION
+# ==========================================
+def process_scan(distances_mm):
+    global scan_counter
+
+    # Calculate Z height for this specific slice
+    current_z = scan_counter * Z_INCREMENT_METERS
+
+    # Create angles array
+    angles = np.linspace(
+        np.radians(-FOV_DEGREES / 2),
+        np.radians(FOV_DEGREES / 2),
+        len(distances_mm)
+    )
+
+    valid_frame_points = 0
+
+    for r, theta in zip(distances_mm, angles):
+        r_meters = r / 1000.0
+
+        # Filter valid range (adjust as needed)
+        if 0.1 < r_meters < 60.0:
+            x = r_meters * np.cos(theta)
+            y = r_meters * np.sin(theta)
+            z = current_z  # Use the incremented Z height
+
+            all_points_buffer.append((x, y, z))
+            valid_frame_points += 1
+
+    scan_counter += 1
+    # Print status every 10 scans so we know it's working
+    if scan_counter % 10 == 0:
+        print(f"Captured Scan #{scan_counter} | Total Points: {len(all_points_buffer)}")
+
+
+# ==========================================
+# MAIN READER LOOP
+# ==========================================
+def run_recorder():
+    global scan_counter
+    ser = None
+
+    print("--- LZR U921 3D RECORDER ---")
+    print(f"Z-Step per scan: {Z_INCREMENT_METERS} meters")
+    print("Press Ctrl+C to stop recording and save the file.\n")
+
     try:
-        with open(filename, 'w') as f:
-            f.write(header)
-            for p in points:
-                f.write(f"{p[0]:.4f} {p[1]:.4f} {p[2]:.4f}\n")
-        print(f"✅ Success! Open '{filename}' in your visualizer.")
-    except Exception as e:
-        print(f"❌ Error saving file: {e}")
+        ser = serial.Serial(port=SERIAL_PORT, baudrate=BAUD_RATE, timeout=1)
+        print(f"Connected to {SERIAL_PORT}. Waiting for data...")
 
-
-def parse_lzr_packet(packet):
-    """Decodes LZR U921 raw bytes into (x, y) coordinates"""
-    try:
-        # LZR Protocol: Header(2) + MsgID(1) + Size(1) + ...
-        # LZR data typically starts after byte 10
-        # This is a simplified parser based on standard LZR raw dumps
-
-        # 1. Parse Header Info
-        lsn = packet[3]  # Sample count
-        if lsn == 0: return []
-
-        # 2. Extract Angles (FSA/LSA)
-        fsa = struct.unpack('<H', packet[4:6])[0]
-        lsa = struct.unpack('<H', packet[6:8])[0]
-
-        start_angle = (fsa >> 1) / 64.0
-        end_angle = (lsa >> 1) / 64.0
-
-        # Handle wrap-around
-        angle_diff = end_angle - start_angle
-        if angle_diff < 0: angle_diff += 360
-
-        angle_step = angle_diff / (lsn - 1) if lsn > 1 else 0
-
-        raw_points_2d = []
-
-        # 3. Parse Distances
-        for i in range(lsn):
-            # Distance is at offset 10 + (i * 2)
-            base_idx = 10 + (i * 2)
-            if base_idx + 2 > len(packet): break
-
-            dist_mm = struct.unpack('<H', packet[base_idx:base_idx + 2])[0]
-
-            # Filter valid range (LZR max is usually ~10m or 65m depending on mode)
-            if 20 < dist_mm < 60000:
-                dist_m = dist_mm / 1000.0  # Convert mm to Meters
-
-                # Calculate Angle
-                current_angle = math.radians(start_angle + (i * angle_step))
-
-                # Convert Polar to Cartesian (X, Y)
-                x = dist_m * math.cos(current_angle)
-                y = dist_m * math.sin(current_angle)
-
-                raw_points_2d.append((x, y))
-
-        return raw_points_2d
-
-    except Exception as e:
-        # print(f"Parse Error: {e}") # Uncomment for debugging
-        return []
-
-
-# --- MAIN LOGIC ---
-if __name__ == "__main__":
-    try:
-        ser = serial.Serial(PORT, BAUD, timeout=1)
-        print(f"🚀 Connected to LZR-U921 on {PORT} @ {BAUD}")
-        print("------------------------------------------------")
-        print(f"👉 MOVE THE SENSOR STEADILY at {SCAN_SPEED * 100} cm/s")
-        print("👉 Press Ctrl+C to STOP and SAVE the 3D model.")
-        print("------------------------------------------------")
-
-        buffer = b''
-        all_3d_points = []
-        start_time = time.time()
-        packet_count = 0
+        buffer = b""
 
         while True:
-            if ser.in_waiting:
-                buffer += ser.read(ser.in_waiting)
+            if ser.in_waiting > 0:
+                chunk = ser.read(ser.in_waiting)
+                buffer += chunk
 
-                # Process buffer for Header 0x55 0xAA
-                while len(buffer) > 10:
-                    # Search for header
-                    if buffer[0] == 0x55 and buffer[1] == 0xAA:
+                # --- PARSING LOGIC ---
+                # Find start byte (Assuming 0x02 STX based on your previous code)
+                start_index = buffer.find(b'\x02')
 
-                        # 1. Determine Packet Size
-                        # Byte 3 is often sample count (LSN). Size = 10 header + (LSN * 2) data + 2 checksum
-                        lsn = buffer[3]
-                        packet_len = 12 + (2 * lsn)  # Approx length formula for LZR
+                if start_index != -1:
+                    buffer = buffer[start_index:]
 
-                        if len(buffer) < packet_len:
-                            break  # Wait for full packet
+                    # Expected size: Header + Data (274*2) + Checksum/Footer
+                    # Adjust '10' if your overhead is different
+                    EXPECTED_SIZE = (POINTS_PER_SCAN * 2) + 10
 
-                        # 2. Extract Packet
-                        packet = buffer[:packet_len]
-                        buffer = buffer[packet_len:]  # Remove from buffer
+                    if len(buffer) >= EXPECTED_SIZE:
+                        # Extract payload (assuming offset 4)
+                        raw_payload = buffer[4: 4 + (POINTS_PER_SCAN * 2)]
 
-                        # 3. Decode 2D Points
-                        points_2d = parse_lzr_packet(packet)
+                        distances = []
+                        for i in range(0, len(raw_payload) - 1, 2):
+                            high = raw_payload[i]
+                            low = raw_payload[i + 1]
+                            dist = (high << 8) + low
+                            distances.append(dist)
 
-                        if points_2d:
-                            # 4. Apply 3D Shift (Time = Z dimension)
-                            elapsed = time.time() - start_time
-                            z_shift = elapsed * SCAN_SPEED
+                        # Accumulate points if valid frame
+                        if len(distances) == POINTS_PER_SCAN:
+                            process_scan(distances)
 
-                            # Add to master list
-                            for (x, y) in points_2d:
-                                all_3d_points.append((x, y, z_shift))
+                        # Clear processed buffer
+                        buffer = buffer[EXPECTED_SIZE:]
 
-                            packet_count += 1
-                            if packet_count % 10 == 0:
-                                sys.stdout.write(
-                                    f"\r⏳ Scanning... {len(all_3d_points)} points collected | Height: {z_shift:.2f}m")
-                                sys.stdout.flush()
+            # Small sleep to prevent CPU hogging
+            time.sleep(0.005)
 
-                    else:
-                        # If header not found, slide buffer by 1 byte to keep searching
-                        buffer = buffer[1:]
-
-    except SerialException as e:
-        print(f"\n❌ Port Error: {e}")
-        print("Check if another script is using the COM port!")
-
+    except serial.SerialException:
+        print(f"[ERROR] Could not open {SERIAL_PORT}.")
     except KeyboardInterrupt:
-        print("\n\n🛑 Scanning Stopped by User.")
-        # Generate Filename with Timestamp
-        final_filename = f"LZR_3D_SCAN_{time.strftime('%H%M%S')}.pcd"
-        save_final_pcd(all_3d_points, final_filename)
-
+        print("\n[STOP] Recording stopped by user.")
     finally:
-        if 'ser' in locals() and ser.is_open:
+        if ser and ser.is_open:
             ser.close()
-            print("🔌 Connection closed.")
+        # SAVE THE FILE ON EXIT
+        save_combined_pcd(all_points_buffer, SAVE_DIRECTORY)
+
+
+if __name__ == "__main__":
+    run_recorder()
