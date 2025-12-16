@@ -16,8 +16,8 @@ FOV_DEGREES = 96.0  # Field of View
 SAVE_DIRECTORY = "./scans"  # Folder where files will be saved
 
 # 3D VISUALIZATION SETTINGS
-# How much to move the Z-axis for every scan frame (simulating movement)
-# 0.05 = 5cm per scan. Adjust this based on how fast you move the sensor.
+# How much to move along the road for every scan frame (simulating movement)
+# 0.05 = 5cm per scan. Adjust this based on truck speed.
 Z_INCREMENT_METERS = 0.05
 
 # Global buffer to hold all points until we save
@@ -40,7 +40,7 @@ def save_combined_pcd(points_list, output_folder):
         os.makedirs(output_folder)
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = os.path.join(output_folder, f"lzr_combined_3d_{timestamp}.pcd")
+    filename = os.path.join(output_folder, f"lzr_sideways_3d_{timestamp}.pcd")
 
     num_points = len(points_list)
 
@@ -48,7 +48,7 @@ def save_combined_pcd(points_list, output_folder):
 
     with open(filename, 'w') as f:
         # PCD Header
-        f.write("# .PCD v.7 - LZR U921 Combined 3D Scan\n")
+        f.write("# .PCD v.7 - LZR U921 Sideways Scan\n")
         f.write("VERSION .7\n")
         f.write("FIELDS x y z\n")
         f.write("SIZE 4 4 4\n")
@@ -73,8 +73,8 @@ def save_combined_pcd(points_list, output_folder):
 def process_scan(distances_mm):
     global scan_counter
 
-    # Calculate Z height for this specific slice
-    current_z = scan_counter * Z_INCREMENT_METERS
+    # 'current_length' represents how far the truck has moved (Time axis)
+    current_length = scan_counter * Z_INCREMENT_METERS
 
     # Create angles array
     angles = np.linspace(
@@ -88,17 +88,39 @@ def process_scan(distances_mm):
     for r, theta in zip(distances_mm, angles):
         r_meters = r / 1000.0
 
-        # Filter valid range (adjust as needed)
+        # Filter valid range (0.1m to 60m)
         if 0.1 < r_meters < 60.0:
-            x = r_meters * np.cos(theta)
-            y = r_meters * np.sin(theta)
-            z = current_z  # Use the incremented Z height
+            # --- RAW POLAR COORDINATES (Relative to Sensor) ---
+            # If sensor is sideways:
+            # raw_x = Horizontal distance (Width/Depth)
+            # raw_y = Vertical spread (Height) - depending on exact mount orientation
 
-            all_points_buffer.append((x, y, z))
+            raw_x = r_meters * np.cos(theta)
+            raw_y = r_meters * np.sin(theta)
+
+            # --- COORDINATE MAPPING FOR SIDEWAYS MOUNT ---
+            # We map sensor coordinates to World coordinates:
+            # World X = Truck Length (Direction of travel)
+            # World Y = Truck Width (Distance from sensor)
+            # World Z = Truck Height (Vertical scan slice)
+
+            # 1. Length is purely time-based
+            x_world = current_length
+
+            # 2. Width is the primary distance from sensor
+            # We use absolute value to ensure width is positive
+            y_world = abs(raw_x)
+
+            # 3. Height comes from the sweep angle
+            # Note: You might need to add a mounting offset here (e.g., +1.5m)
+            # if the sensor is mounted high up looking down.
+            z_world = raw_y
+
+            all_points_buffer.append((x_world, y_world, z_world))
             valid_frame_points += 1
 
     scan_counter += 1
-    # Print status every 10 scans so we know it's working
+    # Print status every 10 scans
     if scan_counter % 10 == 0:
         print(f"Captured Scan #{scan_counter} | Total Points: {len(all_points_buffer)}")
 
@@ -110,8 +132,9 @@ def run_recorder():
     global scan_counter
     ser = None
 
-    print("--- LZR U921 3D RECORDER ---")
+    print("--- LZR U921 SIDEWAYS RECORDER ---")
     print(f"Z-Step per scan: {Z_INCREMENT_METERS} meters")
+    print("Coordinates rotated: X=Length, Y=Width, Z=Height")
     print("Press Ctrl+C to stop recording and save the file.\n")
 
     try:
@@ -126,14 +149,13 @@ def run_recorder():
                 buffer += chunk
 
                 # --- PARSING LOGIC ---
-                # Find start byte (Assuming 0x02 STX based on your previous code)
+                # Find start byte (Assuming 0x02 STX)
                 start_index = buffer.find(b'\x02')
 
                 if start_index != -1:
                     buffer = buffer[start_index:]
 
                     # Expected size: Header + Data (274*2) + Checksum/Footer
-                    # Adjust '10' if your overhead is different
                     EXPECTED_SIZE = (POINTS_PER_SCAN * 2) + 10
 
                     if len(buffer) >= EXPECTED_SIZE:
