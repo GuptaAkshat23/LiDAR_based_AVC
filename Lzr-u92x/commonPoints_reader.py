@@ -19,10 +19,10 @@ SAVE_DIRECTORY = "./scans"
 # 0.05 = 5cm.
 GRID_RESOLUTION = 0.05
 
-# 0.20 = 20%.
-# A point must appear in 20% of the frames to be saved.
-# (e.g., if you capture 100 frames, the point must appear in at least 20 of them)
-MIN_PERSISTENCE_RATIO = 0.20
+# 0.30 = 30%.
+# A point must appear in 30% of the frames to be saved.
+# This balances noise reduction with sensitivity.
+MIN_PERSISTENCE_RATIO = 0.30
 
 # Global storage for grid counting
 # Format: { (grid_x, grid_y): hit_count }
@@ -35,7 +35,7 @@ total_frames_captured = 0
 # ==========================================
 def save_filtered_pcd(grid_data, total_scans, output_folder):
     """
-    Filters the grid based on persistence (20% threshold) and saves valid points.
+    Filters the grid based on persistence (30% threshold) and saves valid points.
     """
     if not grid_data:
         print("[WARNING] No data collected.")
@@ -44,7 +44,7 @@ def save_filtered_pcd(grid_data, total_scans, output_folder):
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
 
-    # Calculate the minimum hits required (20% of total scans)
+    # Calculate the minimum hits required (30% of total scans)
     min_hits_required = int(total_scans * MIN_PERSISTENCE_RATIO)
 
     # Safety check: ensure we require at least 1 hit
@@ -71,13 +71,13 @@ def save_filtered_pcd(grid_data, total_scans, output_folder):
         return
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = os.path.join(output_folder, f"lzr_filtered_20percent_{timestamp}.pcd")
+    filename = os.path.join(output_folder, f"lzr_filtered_30percent_{timestamp}.pcd")
     num_points = len(final_points)
 
     print(f"[SAVING] Writing {num_points} filtered points to {filename}...")
 
     with open(filename, 'w') as f:
-        f.write("# .PCD v.7 - LZR U921 20% Persistence Filter\n")
+        f.write("# .PCD v.7 - LZR U921 30% Persistence Filter\n")
         f.write("VERSION .7\n")
         f.write("FIELDS x y z\n")
         f.write("SIZE 4 4 4\n")
@@ -146,10 +146,10 @@ def process_scan(distances_mm):
 # ==========================================
 def run_recorder():
     ser = None
-    print("--- LZR U921 FILTER (20%) ---")
+    print("--- LZR U921 BALANCED FILTER (30%) ---")
     print(f"Grid Resolution: {GRID_RESOLUTION * 100} cm")
     print(f"Persistence Threshold: {MIN_PERSISTENCE_RATIO * 100}%")
-    print("Filter active: Points must appear in at least 1/5 of scans.")
+    print("Filter active: Points must appear in ~1/3 of scans.")
     print("Press Ctrl+C to stop and save.\n")
 
     try:
