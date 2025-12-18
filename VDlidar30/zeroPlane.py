@@ -4,12 +4,13 @@ import time
 import struct
 import sys
 import statistics
+import os
 
 # --- CONFIGURATION ---
 PORT = 'COM3'  # Adjust to your TG30 Port
 BAUD = 512000  # TG30 Standard Baud Rate
-FRAMES_TO_COLLECT = 50  # How many frames to average before saving the final model
 ANGLE_BIN_SIZE = 0.5  # Resolution in degrees (0.5 deg bins = 720 bins total)
+OUTPUT_FOLDER = "scans"  # Folder name to save files
 
 # --- GLOBAL STORAGE ---
 # Dictionary to store lists of distances for each angle bin
@@ -25,15 +26,26 @@ def get_bin_index(angle):
 def save_single_zero_plane(bins, filename="final_zero_plane.pcd"):
     """
     Computes the MEDIAN distance for each bin to remove dynamic noise
-    and saves a SINGLE clean Zero-Plane PCD file.
+    and saves a SINGLE clean Zero-Plane PCD file in the 'scans' folder.
     """
     clean_points = []
 
-    print(f"\n\nProcessing Statistical Model from {len(bins)} angle segments...")
+    print(f"\n\n🛑 Stopping... Analyzing {len(bins)} angle segments...")
+    print("   Computing Median (Statistical Background Model)... please wait.")
 
+    # 1. Ensure Output Folder Exists
+    if not os.path.exists(OUTPUT_FOLDER):
+        try:
+            os.makedirs(OUTPUT_FOLDER)
+            print(f"   Created folder: '{OUTPUT_FOLDER}'")
+        except OSError as e:
+            print(f"❌ Error creating folder: {e}")
+            return
+
+    # 2. Process Data
     for bin_idx, distances in bins.items():
-        if len(distances) > 5:  # Threshold: Ignore bins with too little data
-            # Statistical Filter: Use Median to reject outliers (temporary obstacles/noise)
+        if len(distances) > 0:
+            # Statistical Filter: Use Median to reject outliers
             median_dist = statistics.median(distances)
 
             # Reconstruct X, Y from the Bin Angle and Median Distance
@@ -50,7 +62,10 @@ def save_single_zero_plane(bins, filename="final_zero_plane.pcd"):
         print("❌ Error: No valid points to save.")
         return
 
-    # Write the PCD Header
+    # 3. Construct Full Path
+    full_path = os.path.join(OUTPUT_FOLDER, filename)
+
+    # 4. Write the PCD Header & Data
     header = f"""# .PCD v0.7 - Point Cloud Data file format
 VERSION 0.7
 FIELDS x y z
@@ -63,13 +78,15 @@ VIEWPOINT 0 0 0 1 0 0 0
 POINTS {len(clean_points)}
 DATA ascii
 """
-    with open(filename, 'w') as f:
-        f.write(header)
-        for p in clean_points:
-            # Z is hardcoded to 0.000 (Zero Plane)
-            f.write(f"{p[0]:.3f} {p[1]:.3f} 0.000\n")
-
-    print(f"✅ SUCCESS: Saved 'final_zero_plane.pcd' with {len(clean_points)} static points.")
+    try:
+        with open(full_path, 'w') as f:
+            f.write(header)
+            for p in clean_points:
+                # Z is hardcoded to 0.000 (Zero Plane)
+                f.write(f"{p[0]:.3f} {p[1]:.3f} 0.000\n")
+        print(f"✅ SUCCESS: Saved '{full_path}' with {len(clean_points)} static points.")
+    except Exception as e:
+        print(f"❌ File Write Error: {e}")
 
 
 def parse_packet(packet):
@@ -98,7 +115,6 @@ def parse_packet(packet):
 
             if distance > 0:
                 current_angle = angle_fsa + (angle_step * i)
-                # Store pure polar data (Angle, Distance) for statistical processing
                 parsed_data.append((current_angle, distance))
 
         return parsed_data
@@ -116,13 +132,16 @@ if __name__ == "__main__":
         ser.reset_input_buffer()
 
         print(f"🚀 Building Statistical Zero Plane on {PORT}")
-        print(f"🎯 Target: Collect {FRAMES_TO_COLLECT} frames for averaging...")
+        print(f"📂 Output will be saved to: ./{OUTPUT_FOLDER}/")
+        print("💡 Recording indefinitely. Press CTRL+C to stop and save.")
+        print("-" * 50)
 
         buffer = b''
         previous_angle = 0.0
         frame_count = 0
+        points_accumulated = 0
 
-        while frame_count < FRAMES_TO_COLLECT:
+        while True:
             if ser.in_waiting:
                 buffer += ser.read(ser.in_waiting)
 
@@ -141,42 +160,36 @@ if __name__ == "__main__":
                         new_data = parse_packet(packet)
 
                         for (angle, distance) in new_data:
-                            # 1. Binning Logic (Statistical Accumulation)
+                            # 1. Binning Logic
                             b_idx = get_bin_index(angle)
                             if b_idx not in polar_bins:
                                 polar_bins[b_idx] = []
                             polar_bins[b_idx].append(distance)
+                            points_accumulated += 1
 
-                            # 2. Frame Detection
+                            # 2. Frame Detection (for UI only)
                             if angle < previous_angle and previous_angle > 300 and angle < 50:
                                 frame_count += 1
 
-                                # Progress Bar
-                                percent = (frame_count / FRAMES_TO_COLLECT) * 100
+                                # Live Status
                                 sys.stdout.write(
-                                    f"\r[Progress] {frame_count}/{FRAMES_TO_COLLECT} frames ({percent:.1f}%)")
+                                    f"\r[Recording] Frames: {frame_count} | "
+                                    f"Total Samples: {points_accumulated} "
+                                )
                                 sys.stdout.flush()
-
-                                if frame_count >= FRAMES_TO_COLLECT:
-                                    break
 
                             previous_angle = angle
                     else:
                         buffer = buffer[1:]
 
-        # --- FINAL PROCESSING ---
-        save_single_zero_plane(polar_bins)
-
-        # Cleanup
-        ser.write(b'\xA5\x65')
-        ser.close()
-
     except KeyboardInterrupt:
-        print("\n🛑 Interrupted! Saving what we have so far...")
-        save_single_zero_plane(polar_bins)
+        # This block runs when you press CTRL+C
         if 'ser' in locals() and ser.is_open:
-            ser.write(b'\xA5\x65')
+            ser.write(b'\xA5\x65')  # Stop command
             ser.close()
+
+        # PROCESS AND SAVE DATA
+        save_single_zero_plane(polar_bins)
 
     except Exception as e:
         print(f"\nError: {e}")
