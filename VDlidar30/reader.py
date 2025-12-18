@@ -3,7 +3,7 @@ import math
 import time
 import struct
 
-PORT = 'COM7'
+PORT = 'COM3'
 BAUD = 512000
 
 

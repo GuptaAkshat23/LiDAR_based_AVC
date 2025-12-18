@@ -5,7 +5,7 @@ import struct
 import sys
 
 # --- CONFIGURATION ---
-PORT = 'COM7'  # Adjust to your TG30 Port
+PORT = 'COM3'  # Adjust to your TG30 Port
 BAUD = 512000  # TG30 Standard Baud Rate
 SAVE_TO_FILE = True  # Set to False if you only want to view stats
 
