@@ -3,12 +3,9 @@ import math
 import time
 import struct
 
-# --- CONFIGURATION ---
-PORT = 'COM3'  # CHANGE THIS to your actual port (from Device Manager)
-BAUD = 512000  # YDLIDAR TG30 Standard
+PORT = 'COM7'
+BAUD = 512000
 
-
-# ---------------------
 
 def save_pcd(points, filename):
     # Only save if we have a decent amount of data (e.g., > 100 points)
@@ -118,12 +115,12 @@ try:
                             save_pcd(current_scan_points, f"scan_full_{timestamp}.pcd")
                             current_scan_points = []  # Reset for next circle
 
-                        # Add point to current buffer
+
                         current_scan_points.append((x, y))
                         previous_angle = angle
 
                 else:
-                    buffer = buffer[1:]  # Skip garbage bytes
+                    buffer = buffer[1:]
 
 except KeyboardInterrupt:
     if 'ser' in locals():
