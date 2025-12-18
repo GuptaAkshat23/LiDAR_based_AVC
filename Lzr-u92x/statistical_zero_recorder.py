@@ -10,17 +10,18 @@ import sys
 SERIAL_PORT = 'COM5'
 BAUD_RATE = 460800
 POINTS_PER_SCAN = 274
+FOV_DEGREES = 96.0
 EXPECTED_PACKET_SIZE = (POINTS_PER_SCAN * 2) + 10
 
 OUTPUT_FOLDER = "zero_plane"
-MODEL_FILENAME = "statistical_background.npz"
+FILENAME_PCD = "master_zero_plane.pcd"
 
-FRAMES_TO_CAPTURE = 500  # More frames = Better statistics
+FRAMES_TO_CAPTURE = 500  # High count for better stats
 
 
 def run_recorder():
-    print(f"--- 📊 STATISTICAL BACKGROUND RECORDER ---")
-    print(f"Capturing {FRAMES_TO_CAPTURE} frames to model sensor noise...")
+    print(f"--- 📊 STATISTICAL BACKGROUND RECORDER (PCD OUTPUT) ---")
+    print(f"Capturing {FRAMES_TO_CAPTURE} frames...")
 
     if not os.path.exists(OUTPUT_FOLDER):
         os.makedirs(OUTPUT_FOLDER)
@@ -28,7 +29,6 @@ def run_recorder():
     ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
     time.sleep(1)
 
-    # Buffer to hold all raw scans: Shape (N, 274)
     raw_scans = []
     serial_buf = b""
 
@@ -38,67 +38,97 @@ def run_recorder():
                 serial_buf += ser.read(ser.in_waiting)
 
             while True:
-                # Find Header (LZR standard 0x02)
                 idx = serial_buf.find(b'\x02')
                 if idx == -1:
                     serial_buf = b""
                     break
-
-                if idx > 0:
-                    serial_buf = serial_buf[idx:]
+                if idx > 0: serial_buf = serial_buf[idx:]
 
                 if len(serial_buf) < EXPECTED_PACKET_SIZE:
                     break
 
-                # Extract Payload
                 payload = serial_buf[4: 4 + (POINTS_PER_SCAN * 2)]
-
-                # Fast Numpy Decoding
-                raw_bytes = np.frombuffer(payload, dtype=np.uint8)
-                high = raw_bytes[0::2].astype(np.uint16)
-                low = raw_bytes[1::2].astype(np.uint16)
+                raw = np.frombuffer(payload, dtype=np.uint8)
+                high = raw[0::2].astype(np.uint16)
+                low = raw[1::2].astype(np.uint16)
                 distances = (high << 8) | low
 
                 if len(distances) == POINTS_PER_SCAN:
-                    # Filter basic errors (0 or max range)
-                    # We treat error codes as NaN so they don't mess up stats
-                    distances = distances.astype(float)
-                    distances[distances < 100] = np.nan
-                    distances[distances > 60000] = np.nan
+                    d_float = distances.astype(float)
+                    # Filter bad reads
+                    d_float[d_float < 100] = np.nan
+                    d_float[d_float > 60000] = np.nan
 
-                    raw_scans.append(distances)
+                    raw_scans.append(d_float)
                     sys.stdout.write(f"\rCaptured: {len(raw_scans)}/{FRAMES_TO_CAPTURE}")
                     sys.stdout.flush()
 
                 serial_buf = serial_buf[EXPECTED_PACKET_SIZE:]
 
     except KeyboardInterrupt:
-        print("\nStopped early.")
+        print("\nStopped.")
     finally:
         ser.close()
 
     # --- PROCESSING ---
-    print("\n\n🧠 Computing Statistical Model...")
-    data_matrix = np.array(raw_scans)  # Shape (Frames, 274)
+    print("\n\n🧠 Computing Statistics...")
+    data = np.array(raw_scans)
 
-    # 1. Calculate Mean (The "Zero Plane") ignoring NaNs
-    bg_mean = np.nanmean(data_matrix, axis=0)
+    # 1. Compute Mean (The Wall Shape) & Std (The Noise)
+    # Convert to METERS immediately for PCD
+    bg_mean_mm = np.nanmean(data, axis=0)
+    bg_std_mm = np.nanstd(data, axis=0)
 
-    # 2. Calculate Std Dev (The "Noise Level") ignoring NaNs
-    bg_std = np.nanstd(data_matrix, axis=0)
+    # Handle dead zones (NaN -> 0)
+    bg_mean_mm = np.nan_to_num(bg_mean_mm)
+    bg_std_mm = np.nan_to_num(bg_std_mm)
 
-    # 3. Safety: Fill remaining NaNs (dead zones) with 0
-    bg_mean = np.nan_to_num(bg_mean)
-    bg_std = np.nan_to_num(bg_std)
+    bg_mean_m = bg_mean_mm / 1000.0
+    bg_std_m = bg_std_mm / 1000.0
 
-    # 4. Save Compressed Model
-    save_path = os.path.join(OUTPUT_FOLDER, MODEL_FILENAME)
-    np.savez(save_path, mean=bg_mean, std=bg_std)
+    # 2. Convert to Cartesian X/Y for PCD
+    angles = np.linspace(
+        np.radians(-FOV_DEGREES / 2),
+        np.radians(FOV_DEGREES / 2),
+        POINTS_PER_SCAN
+    )
 
-    print(f"✅ Model Saved: {save_path}")
-    print(f"   Mean Profile Shape: {bg_mean.shape}")
-    print(f"   Noise Profile Shape: {bg_std.shape}")
-    print("   (Use this file in the remover script)")
+    points = []
+
+    # We iterate 0 to 273
+    for i in range(POINTS_PER_SCAN):
+        r = bg_mean_m[i]
+        noise = bg_std_m[i]
+        theta = angles[i]
+
+        if r > 0.05:  # Only save valid background points
+            x = r * np.cos(theta)
+            y = r * np.sin(theta)
+            z = 0.0
+            # Store NOISE in Intensity field
+            points.append((x, y, z, noise))
+
+    # 3. Save PCD
+    save_path = os.path.join(OUTPUT_FOLDER, FILENAME_PCD)
+    with open(save_path, 'w') as f:
+        f.write(f"# .PCD v.7 - Mean=XYZ, StdDev=Intensity\n")
+        f.write("VERSION .7\n")
+        f.write("FIELDS x y z intensity\n")  # Intensity holds the variance
+        f.write("SIZE 4 4 4 4\n")
+        f.write("TYPE F F F F\n")
+        f.write("COUNT 1 1 1 1\n")
+        f.write(f"WIDTH {len(points)}\n")
+        f.write("HEIGHT 1\n")
+        f.write("VIEWPOINT 0 0 0 1 0 0 0\n")
+        f.write(f"POINTS {len(points)}\n")
+        f.write("DATA ascii\n")
+        for p in points:
+            f.write(f"{p[0]:.4f} {p[1]:.4f} {p[2]:.4f} {p[3]:.6f}\n")
+
+    print(f"✅ PCD Saved: {save_path}")
+    print("   Open this in Open3D/CloudCompare.")
+    print("   - The dots show the Zero Plane.")
+    print("   - The 'Intensity' color shows the Noise Level.")
 
 
 if __name__ == "__main__":
