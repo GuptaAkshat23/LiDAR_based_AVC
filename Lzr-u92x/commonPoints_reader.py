@@ -8,7 +8,7 @@ import sys
 # ==========================================
 # CONFIGURATION
 # ==========================================
-SERIAL_PORT = 'COM4'  # Change to your port
+SERIAL_PORT = 'COM5'  # Change to your port
 BAUD_RATE = 460800  # Standard LZR U921 baud rate
 POINTS_PER_SCAN = 274  # Standard LZR resolution
 FOV_DEGREES = 96.0  # Field of View
