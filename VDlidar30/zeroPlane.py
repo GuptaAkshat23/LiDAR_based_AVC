@@ -3,51 +3,81 @@ import math
 import time
 import struct
 import sys
+import statistics
 
 # --- CONFIGURATION ---
 PORT = 'COM3'  # Adjust to your TG30 Port
 BAUD = 512000  # TG30 Standard Baud Rate
-SAVE_TO_FILE = True  # Set to False if you only want to view stats
+FRAMES_TO_COLLECT = 50  # How many frames to average before saving the final model
+ANGLE_BIN_SIZE = 0.5  # Resolution in degrees (0.5 deg bins = 720 bins total)
+
+# --- GLOBAL STORAGE ---
+# Dictionary to store lists of distances for each angle bin
+# Format: { bin_index: [dist1, dist2, dist3...], ... }
+polar_bins = {}
 
 
-def save_pcd(points, frame_id):
-    """Saves the scan as a Zero-Plane (Z=0) PCD file."""
-    if len(points) < 50:
-        return False  # Skip empty/noise frames
+def get_bin_index(angle):
+    """Converts an angle (0-360) into a bin index based on resolution."""
+    return int(angle / ANGLE_BIN_SIZE)
 
-    filename = f"scan_{frame_id:04d}.pcd"
 
+def save_single_zero_plane(bins, filename="final_zero_plane.pcd"):
+    """
+    Computes the MEDIAN distance for each bin to remove dynamic noise
+    and saves a SINGLE clean Zero-Plane PCD file.
+    """
+    clean_points = []
+
+    print(f"\n\nProcessing Statistical Model from {len(bins)} angle segments...")
+
+    for bin_idx, distances in bins.items():
+        if len(distances) > 5:  # Threshold: Ignore bins with too little data
+            # Statistical Filter: Use Median to reject outliers (temporary obstacles/noise)
+            median_dist = statistics.median(distances)
+
+            # Reconstruct X, Y from the Bin Angle and Median Distance
+            # We use the center angle of the bin
+            angle_center = (bin_idx * ANGLE_BIN_SIZE) + (ANGLE_BIN_SIZE / 2)
+            angle_rad = math.radians(angle_center)
+
+            x = (median_dist / 1000.0) * math.cos(angle_rad)
+            y = (median_dist / 1000.0) * math.sin(angle_rad)
+
+            clean_points.append((x, y))
+
+    if not clean_points:
+        print("❌ Error: No valid points to save.")
+        return
+
+    # Write the PCD Header
     header = f"""# .PCD v0.7 - Point Cloud Data file format
 VERSION 0.7
 FIELDS x y z
 SIZE 4 4 4
 TYPE F F F
 COUNT 1 1 1
-WIDTH {len(points)}
+WIDTH {len(clean_points)}
 HEIGHT 1
 VIEWPOINT 0 0 0 1 0 0 0
-POINTS {len(points)}
+POINTS {len(clean_points)}
 DATA ascii
 """
-    try:
-        with open(filename, 'w') as f:
-            f.write(header)
-            for p in points:
-                # Z is hardcoded to 0.000 for the "Zero Plane" approach
-                f.write(f"{p[0]:.3f} {p[1]:.3f} 0.000\n")
-        return True
-    except Exception as e:
-        print(f"\nError saving file: {e}")
-        return False
+    with open(filename, 'w') as f:
+        f.write(header)
+        for p in clean_points:
+            # Z is hardcoded to 0.000 (Zero Plane)
+            f.write(f"{p[0]:.3f} {p[1]:.3f} 0.000\n")
+
+    print(f"✅ SUCCESS: Saved 'final_zero_plane.pcd' with {len(clean_points)} static points.")
 
 
 def parse_packet(packet):
-    """Decodes YDLidar packet. Returns list of (angle, x, y)."""
+    """Decodes YDLidar packet. Returns list of (angle, distance_mm)."""
     try:
         lsn = packet[3]
         if lsn <= 0: return []
 
-        # FSA (First Sample Angle) and LSA (Last Sample Angle)
         fsa = struct.unpack('<H', packet[4:6])[0]
         lsa = struct.unpack('<H', packet[6:8])[0]
 
@@ -59,28 +89,20 @@ def parse_packet(packet):
 
         angle_step = diff / (lsn - 1) if lsn > 1 else 0
 
-        parsed_points = []
+        parsed_data = []
 
         for i in range(lsn):
-            # TG30 Standard: 2 bytes for distance.
-            # NOTE: If your TG30 is in Intensity Mode, this offset might need to be 3 bytes per point.
-            idx = 10 + (2 * i)
-
+            idx = 10 + (2 * i)  # TG30 Standard 2-byte distance
             dist_data = struct.unpack('<H', packet[idx:idx + 2])[0]
             distance = dist_data / 4.0
 
             if distance > 0:
                 current_angle = angle_fsa + (angle_step * i)
-                angle_rad = math.radians(current_angle)
+                # Store pure polar data (Angle, Distance) for statistical processing
+                parsed_data.append((current_angle, distance))
 
-                # Project to Zero Plane (2D -> 3D)
-                x = (distance / 1000.0) * math.cos(angle_rad)
-                y = (distance / 1000.0) * math.sin(angle_rad)
-
-                parsed_points.append((current_angle, x, y))
-
-        return parsed_points
-    except Exception:
+        return parsed_data
+    except:
         return []
 
 
@@ -88,88 +110,73 @@ def parse_packet(packet):
 if __name__ == "__main__":
     try:
         ser = serial.Serial(PORT, BAUD, timeout=1)
-
-        # 1. Reset/Wake Up
         ser.setDTR(True)
-        ser.write(b'\xA5\x60')  # Scan Command
+        ser.write(b'\xA5\x60')
         time.sleep(0.5)
         ser.reset_input_buffer()
 
-        print(f"🚀 YDLidar TG30 Connected on {PORT}")
-        print("Waiting for data stream...\n")
+        print(f"🚀 Building Statistical Zero Plane on {PORT}")
+        print(f"🎯 Target: Collect {FRAMES_TO_COLLECT} frames for averaging...")
 
         buffer = b''
-        current_scan_points = []
         previous_angle = 0.0
         frame_count = 0
 
-        start_time = time.time()
-
-        while True:
+        while frame_count < FRAMES_TO_COLLECT:
             if ser.in_waiting:
                 buffer += ser.read(ser.in_waiting)
 
-                # Process packets
                 while len(buffer) > 10:
-                    # Sync Header: AA 55
                     if buffer[0] == 0xAA and buffer[1] == 0x55:
-
-                        # Packet Type Check (CT byte)
-                        # type_byte = buffer[2]
                         lsn = buffer[3]
-
-                        # Calculate Packet Length: Header(10) + Data(2 * LSN)
-                        # Warning: If TG30 sends intensity, change 2 to 3 below
                         packet_len = 10 + (2 * lsn)
 
                         if len(buffer) < packet_len:
-                            break  # Buffer incomplete, wait for more bytes
+                            break
 
                         packet = buffer[:packet_len]
                         buffer = buffer[packet_len:]
 
-                        # Parse
+                        # Get Data
                         new_data = parse_packet(packet)
 
-                        for (angle, x, y) in new_data:
-                            # --- END OF CIRCLE DETECTION ---
-                            # Angle wraps from ~359 to ~0
+                        for (angle, distance) in new_data:
+                            # 1. Binning Logic (Statistical Accumulation)
+                            b_idx = get_bin_index(angle)
+                            if b_idx not in polar_bins:
+                                polar_bins[b_idx] = []
+                            polar_bins[b_idx].append(distance)
+
+                            # 2. Frame Detection
                             if angle < previous_angle and previous_angle > 300 and angle < 50:
-
-                                # 1. Frame Complete
                                 frame_count += 1
-                                points_in_frame = len(current_scan_points)
 
-                                # 2. Save Data
-                                saved_status = "Skipped"
-                                if SAVE_TO_FILE:
-                                    if save_pcd(current_scan_points, frame_count):
-                                        saved_status = "Saved"
-
-                                # 3. Display Stats (Overwrites previous line)
+                                # Progress Bar
+                                percent = (frame_count / FRAMES_TO_COLLECT) * 100
                                 sys.stdout.write(
-                                    f"\r[Recording] Frames Taken: {frame_count} | "
-                                    f"Points: {points_in_frame:04d} | "
-                                    f"Status: {saved_status}   "
-                                )
+                                    f"\r[Progress] {frame_count}/{FRAMES_TO_COLLECT} frames ({percent:.1f}%)")
                                 sys.stdout.flush()
 
-                                # Reset for next frame
-                                current_scan_points = []
+                                if frame_count >= FRAMES_TO_COLLECT:
+                                    break
 
-                            current_scan_points.append((x, y))
                             previous_angle = angle
-
                     else:
-                        # If header not found, slide buffer by 1 to find sync
                         buffer = buffer[1:]
 
+        # --- FINAL PROCESSING ---
+        save_single_zero_plane(polar_bins)
+
+        # Cleanup
+        ser.write(b'\xA5\x65')
+        ser.close()
+
     except KeyboardInterrupt:
+        print("\n🛑 Interrupted! Saving what we have so far...")
+        save_single_zero_plane(polar_bins)
         if 'ser' in locals() and ser.is_open:
-            ser.write(b'\xA5\x65')  # Stop Command
+            ser.write(b'\xA5\x65')
             ser.close()
-        print("\n\n🛑 Stopped by User.")
-        print(f"Total Frames Captured: {frame_count}")
 
     except Exception as e:
         print(f"\nError: {e}")
