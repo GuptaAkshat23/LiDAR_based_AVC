@@ -14,8 +14,6 @@ BAUD_RATE = 460800
 POINTS_PER_SCAN = 274
 FOV_DEGREES = 96.0
 
-DURATION_SEC = 10.0
-
 MIN_VALID_DISTANCE_MM = 50
 MAX_VALID_DISTANCE_MM = 80000
 
@@ -27,7 +25,6 @@ FILENAME_NPY = "master_zero_plane.npy"
 
 MIN_FRAMES_REQUIRED = 30
 SPATIAL_KERNEL = 5  # must be odd
-
 # ==========================================
 
 
@@ -42,6 +39,9 @@ def save_static_pcd(distances, folder, filename):
 
     points = []
     for r, theta in zip(distances, angles):
+        if np.isnan(r):
+            continue
+
         r_m = r / 1000.0
         if 0.05 < r_m < 80.0:
             x = r_m * np.cos(theta)
@@ -67,8 +67,8 @@ def save_static_pcd(distances, folder, filename):
 
 
 def record_zero_plane():
-    print("\n🎯 RECORDING MASTER ZERO PLANE")
-    print("⚠️  ENSURE ABSOLUTE STILLNESS\n")
+    print("\n🎯 RECORDING MASTER ZERO PLANE (CONTINUOUS MODE)")
+    print("⚠️  PRESS Ctrl+C TO STOP RECORDING\n")
 
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
@@ -81,51 +81,56 @@ def record_zero_plane():
     total_packets = 0
     valid_packets = 0
 
-    start_time = time.time()
     print("🔴 Recording...")
 
-    while time.time() - start_time < DURATION_SEC:
-        serial_buffer += ser.read(ser.in_waiting or 1)
+    try:  # <<< MODIFIED
+        while True:  # <<< MODIFIED (infinite loop)
+            serial_buffer += ser.read(ser.in_waiting or 1)
 
-        while True:
-            start_idx = serial_buffer.find(b'\x02')
-            if start_idx == -1:
-                serial_buffer = b""
-                break
+            while True:
+                start_idx = serial_buffer.find(b'\x02')
+                if start_idx == -1:
+                    serial_buffer = b""
+                    break
 
-            if start_idx > 0:
-                serial_buffer = serial_buffer[start_idx:]
+                if start_idx > 0:
+                    serial_buffer = serial_buffer[start_idx:]
 
-            if len(serial_buffer) < EXPECTED_PACKET_SIZE:
-                break
+                if len(serial_buffer) < EXPECTED_PACKET_SIZE:
+                    break
 
-            total_packets += 1
+                total_packets += 1
 
-            payload = serial_buffer[4:4 + POINTS_PER_SCAN * 2]
-            raw = np.frombuffer(payload, dtype=np.uint8)
+                payload = serial_buffer[4:4 + POINTS_PER_SCAN * 2]
+                raw = np.frombuffer(payload, dtype=np.uint8)
 
-            high = raw[0::2].astype(np.uint16)
-            low = raw[1::2].astype(np.uint16)
-            distances = (high << 8) | low
+                high = raw[0::2].astype(np.uint16)
+                low = raw[1::2].astype(np.uint16)
+                distances = (high << 8) | low
 
-            valid_ratio = np.count_nonzero(
-                (distances > MIN_VALID_DISTANCE_MM) &
-                (distances < MAX_VALID_DISTANCE_MM)
-            ) / POINTS_PER_SCAN
+                valid_ratio = np.count_nonzero(
+                    (distances > MIN_VALID_DISTANCE_MM) &
+                    (distances < MAX_VALID_DISTANCE_MM)
+                ) / POINTS_PER_SCAN
 
-            if valid_ratio > 0.65:
-                scan_buffer.append(distances)
-                valid_packets += 1
-                sys.stdout.write(f"\rFrames captured: {len(scan_buffer)}")
-                sys.stdout.flush()
+                if valid_ratio > 0.65:
+                    scan_buffer.append(distances)
+                    valid_packets += 1
+                    sys.stdout.write(
+                        f"\rFrames captured: {len(scan_buffer)}"
+                    )
+                    sys.stdout.flush()
 
-            serial_buffer = serial_buffer[EXPECTED_PACKET_SIZE:]
+                serial_buffer = serial_buffer[EXPECTED_PACKET_SIZE:]
 
-    ser.close()
-    print("\n🛑 Capture complete.")
+    except KeyboardInterrupt:  # <<< MODIFIED
+        print("\n🛑 Manual stop received.")
 
-    print(f"📦 Total packets seen: {total_packets}")
-    print(f"✅ Valid packets used: {valid_packets}")
+    finally:
+        ser.close()
+
+    print("\n📦 Total packets seen:", total_packets)
+    print("✅ Valid packets used:", valid_packets)
 
     if len(scan_buffer) < MIN_FRAMES_REQUIRED:
         print("❌ Not enough clean data.")
@@ -138,23 +143,17 @@ def record_zero_plane():
 
     data = np.array(scan_buffer)
 
-    # Median profile
     median_profile = np.median(data, axis=0)
-
-    # Median Absolute Deviation (robust noise metric)
     mad = np.median(np.abs(data - median_profile), axis=0)
 
-    # Remove unstable angles
     stable_mask = mad < 40  # mm
     median_profile[~stable_mask] = np.nan
     median_profile = np.nanmedian(
         np.vstack([median_profile] * 3), axis=0
     )
 
-    # Spatial smoothing
     median_profile = medfilt(median_profile, SPATIAL_KERNEL)
 
-    # Save outputs
     npy_path = os.path.join(OUTPUT_FOLDER, FILENAME_NPY)
     np.save(npy_path, median_profile)
     print(f"💾 NPY saved: {npy_path}")
