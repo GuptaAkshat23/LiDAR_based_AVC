@@ -7,7 +7,7 @@ import sys
 # ==========================================
 # 🎯 CONFIGURATION
 # ==========================================
-SERIAL_PORT = 'COM4'
+SERIAL_PORT = 'COM5'
 BAUD_RATE = 460800
 POINTS_PER_SCAN = 274
 FOV_DEGREES = 96.0
