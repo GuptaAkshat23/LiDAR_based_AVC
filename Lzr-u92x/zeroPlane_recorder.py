@@ -6,12 +6,7 @@ import sys
 from scipy.signal import medfilt
 
 # ==========================================
-# USER SETTING
-# ==========================================
-CALIBRATION_MODE = "WALL"   # "WALL" or "FLOOR"
-
-# ==========================================
-# HARDWARE CONFIG
+# CONFIGURATION
 # ==========================================
 SERIAL_PORT = 'COM5'
 BAUD_RATE = 460800
@@ -31,7 +26,7 @@ FILENAME_PCD = "master_zero_plane.pcd"
 FILENAME_NPY = "master_zero_plane.npy"
 
 MIN_FRAMES_REQUIRED = 30
-SPATIAL_KERNEL = 5  # odd
+SPATIAL_KERNEL = 5  # must be odd
 
 # ==========================================
 
@@ -47,9 +42,6 @@ def save_static_pcd(distances, folder, filename):
 
     points = []
     for r, theta in zip(distances, angles):
-        if np.isnan(r):
-            continue
-
         r_m = r / 1000.0
         if 0.05 < r_m < 80.0:
             x = r_m * np.cos(theta)
@@ -57,7 +49,7 @@ def save_static_pcd(distances, folder, filename):
             points.append((0.0, abs(x), y))
 
     with open(filepath, 'w') as f:
-        f.write("# .PCD v0.7 - ZERO PLANE\n")
+        f.write("# .PCD v0.7 - MASTER ZERO PLANE\n")
         f.write("VERSION .7\n")
         f.write("FIELDS x y z\n")
         f.write("SIZE 4 4 4\n")
@@ -71,11 +63,11 @@ def save_static_pcd(distances, folder, filename):
         for p in points:
             f.write(f"{p[0]:.5f} {p[1]:.5f} {p[2]:.5f}\n")
 
-    print(f"✅ PCD saved ({len(points)} points): {filepath}")
+    print(f"✅ PCD saved: {filepath}")
 
 
 def record_zero_plane():
-    print(f"\n🎯 ZERO PLANE CALIBRATION MODE: {CALIBRATION_MODE}")
+    print("\n🎯 RECORDING MASTER ZERO PLANE")
     print("⚠️  ENSURE ABSOLUTE STILLNESS\n")
 
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
@@ -85,6 +77,9 @@ def record_zero_plane():
 
     scan_buffer = []
     serial_buffer = b""
+
+    total_packets = 0
+    valid_packets = 0
 
     start_time = time.time()
     print("🔴 Recording...")
@@ -104,6 +99,8 @@ def record_zero_plane():
             if len(serial_buffer) < EXPECTED_PACKET_SIZE:
                 break
 
+            total_packets += 1
+
             payload = serial_buffer[4:4 + POINTS_PER_SCAN * 2]
             raw = np.frombuffer(payload, dtype=np.uint8)
 
@@ -118,13 +115,17 @@ def record_zero_plane():
 
             if valid_ratio > 0.65:
                 scan_buffer.append(distances)
-                sys.stdout.write(f"\rFrames: {len(scan_buffer)}")
+                valid_packets += 1
+                sys.stdout.write(f"\rFrames captured: {len(scan_buffer)}")
                 sys.stdout.flush()
 
             serial_buffer = serial_buffer[EXPECTED_PACKET_SIZE:]
 
     ser.close()
     print("\n🛑 Capture complete.")
+
+    print(f"📦 Total packets seen: {total_packets}")
+    print(f"✅ Valid packets used: {valid_packets}")
 
     if len(scan_buffer) < MIN_FRAMES_REQUIRED:
         print("❌ Not enough clean data.")
@@ -133,54 +134,31 @@ def record_zero_plane():
     # ==========================================
     # PROCESSING
     # ==========================================
+    print("🧠 Computing robust zero plane...")
+
     data = np.array(scan_buffer)
+
+    # Median profile
     median_profile = np.median(data, axis=0)
 
+    # Median Absolute Deviation (robust noise metric)
     mad = np.median(np.abs(data - median_profile), axis=0)
 
-    if CALIBRATION_MODE == "WALL":
-        mad_percentile = 70
-        angle_mask = np.ones(POINTS_PER_SCAN, dtype=bool)
-
-    elif CALIBRATION_MODE == "FLOOR":
-        mad_percentile = 85
-
-        angles = np.linspace(
-            -FOV_DEGREES / 2,
-            FOV_DEGREES / 2,
-            POINTS_PER_SCAN
-        )
-
-        # reject shallow floor grazing rays
-        angle_mask = np.abs(angles) < (FOV_DEGREES * 0.35)
-
-    else:
-        raise ValueError("CALIBRATION_MODE must be WALL or FLOOR")
-
-    mad_threshold = np.percentile(mad[angle_mask], mad_percentile)
-
-    stable_mask = (mad < mad_threshold) & angle_mask
-
-    print(
-        f"MAD → min:{mad.min():.1f} "
-        f"mean:{mad.mean():.1f} "
-        f"max:{mad.max():.1f}"
-    )
-    print(f"Using MAD threshold: {mad_threshold:.1f} mm")
-    print(f"Stable angles: {np.sum(stable_mask)}/{POINTS_PER_SCAN}")
-
+    # Remove unstable angles
+    stable_mask = mad < 40  # mm
     median_profile[~stable_mask] = np.nan
     median_profile = np.nanmedian(
         np.vstack([median_profile] * 3), axis=0
     )
 
-    if np.all(np.isnan(median_profile)):
-        print("❌ All points rejected — fallback to raw median")
-        median_profile = np.median(data, axis=0)
-
+    # Spatial smoothing
     median_profile = medfilt(median_profile, SPATIAL_KERNEL)
 
-    np.save(os.path.join(OUTPUT_FOLDER, FILENAME_NPY), median_profile)
+    # Save outputs
+    npy_path = os.path.join(OUTPUT_FOLDER, FILENAME_NPY)
+    np.save(npy_path, median_profile)
+    print(f"💾 NPY saved: {npy_path}")
+
     save_static_pcd(median_profile, OUTPUT_FOLDER, FILENAME_PCD)
 
     print("\n🏁 ZERO PLANE CREATED SUCCESSFULLY")
