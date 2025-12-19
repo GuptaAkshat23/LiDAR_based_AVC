@@ -6,21 +6,21 @@ import sys
 import os
 
 # --- CONFIGURATION ---
-PORT = 'COM3'  # <--- CHECK PORT
+PORT = 'COM3'  # <--- CHECK YOUR PORT
 BAUD = 512000
 BG_FILE = "scans/final_zero_plane.pcd"
 OUTPUT_FOLDER = "scans_combined"
 
-# -- OPTIMIZATION SETTINGS --
-ANGLE_BIN_SIZE = 0.25  # Reduced from 1.0 to 0.25 for higher precision
-NOISE_TOLERANCE = 0.03  # Reduced from 0.20m to 0.03m (3cm) thanks to interpolation
-VOXEL_SIZE = 0.005  # Snap points to nearest 5mm grid to reduce fuzz
-MIN_DIST_M = 0.15  # Ignore points closer than 15cm (lidar blind spot)
+# -- ROBUSTNESS SETTINGS --
+ANGLE_BIN_SIZE = 0.5  # 0.5 degree bins (720 total bins)
+SEARCH_WINDOW = 2  # Check +/- 2 bins (approx +/- 1 degree) for jitter
+NOISE_TOLERANCE = 0.10  # 10cm Tolerance (Anything closer than 10cm to wall is ignored)
+MIN_DIST_M = 0.20  # Ignore points closer than 20cm to lidar
+VOXEL_SIZE = 0.01  # 1cm grid snapping
 
 # Global storage
-background_map = {}
-# Use a Set for the buffer to automatically remove exact duplicates
-all_dynamic_points_set = set()
+background_bins = {}  # Format: { bin_index: distance_meters }
+dynamic_points_set = set()
 
 
 def get_bin_index(angle):
@@ -29,12 +29,12 @@ def get_bin_index(angle):
 
 
 def load_background_model(filename):
-    """Parses PCD to create a High-Res lookup table."""
+    """Parses PCD to create a robust lookup table."""
     if not os.path.exists(filename):
         print(f"❌ Error: File '{filename}' not found!")
         return False
 
-    print(f"📂 Loading High-Res Background: {filename}...")
+    print(f"📂 Loading Background: {filename}...")
     try:
         with open(filename, 'r') as f:
             lines = f.readlines()
@@ -58,54 +58,60 @@ def load_background_model(filename):
                 angle_deg = math.degrees(angle_rad)
                 if angle_deg < 0: angle_deg += 360
 
-                # Store in bin
+                # Store in bin (Keep the max distance found in this bin to represent the wall)
                 b_idx = get_bin_index(angle_deg)
-                background_map[b_idx] = dist_m
+                if b_idx not in background_bins:
+                    background_bins[b_idx] = dist_m
+                else:
+                    # If multiple points land in one bin, take the average or max
+                    background_bins[b_idx] = (background_bins[b_idx] + dist_m) / 2
                 count += 1
 
-        # Fill gaps: If a bin is empty, use the previous neighbor
-        # This prevents crashes if the background scan had tiny gaps
-        max_bins = int(360 / ANGLE_BIN_SIZE)
-        for i in range(max_bins):
-            if i not in background_map:
-                # Look back up to 5 bins to fill gap
-                for k in range(1, 6):
-                    prev_idx = (i - k) % max_bins
-                    if prev_idx in background_map:
-                        background_map[i] = background_map[prev_idx]
-                        break
-
-        print(f"✅ Background Loaded! Points: {count}")
+        print(f"✅ Background Loaded! Bins filled: {len(background_bins)}")
         return True
     except Exception as e:
         print(f"❌ Error parsing background: {e}")
         return False
 
 
-def get_interpolated_bg_dist(angle):
+def is_background(angle, dist_m):
     """
-    Calculates expected background distance using Linear Interpolation.
-    This allows us to compare exact angles rather than rough bins.
+    Checks if the point belongs to the background using a Sliding Window.
+    Returns True if the point is likely part of the wall.
     """
-    max_bins = int(360 / ANGLE_BIN_SIZE)
+    center_bin = get_bin_index(angle)
 
-    # Exact float index
-    idx_float = angle / ANGLE_BIN_SIZE
+    # Check neighbors (Handle wrap-around 0-360)
+    # We look for the "closest match" in the background
+    min_diff = 999.0
 
-    idx_L = int(idx_float) % max_bins
-    idx_R = (idx_L + 1) % max_bins
+    for i in range(-SEARCH_WINDOW, SEARCH_WINDOW + 1):
+        check_bin = center_bin + i
 
-    dist_L = background_map.get(idx_L, 0)
-    dist_R = background_map.get(idx_R, 0)
+        # Handle 0-360 wrap
+        if check_bin < 0: check_bin += 720
+        if check_bin >= 720: check_bin -= 720
 
-    if dist_L == 0 or dist_R == 0: return None  # Gap in background data
+        bg_dist = background_bins.get(check_bin)
 
-    # Calculate weight (residue)
-    residue = idx_float - int(idx_float)
+        if bg_dist:
+            # Difference between Live Point and this Background Bin
+            diff = dist_m - bg_dist
 
-    # Weighted average
-    expected_dist = dist_L * (1.0 - residue) + dist_R * residue
-    return expected_dist
+            # We only care if the point is BEHIND or ON the wall
+            # If dist_m is 2.0m and bg is 2.0m -> diff is 0 (Background)
+            # If dist_m is 1.0m and bg is 2.0m -> diff is -1.0 (Object)
+
+            # We want to find the BEST fit.
+            if abs(diff) < abs(min_diff):
+                min_diff = diff
+
+    # If the point is within tolerance of the wall (or behind it), it's background
+    # Logic: If min_diff is > -0.10, it means it's not significantly closer than the wall
+    if min_diff > -NOISE_TOLERANCE:
+        return True  # It is the wall (or noise behind wall)
+
+    return False  # It is significantly closer -> OBJECT
 
 
 def save_combined_file(unique_points):
@@ -118,13 +124,15 @@ def save_combined_file(unique_points):
         os.makedirs(OUTPUT_FOLDER)
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    filename = os.path.join(OUTPUT_FOLDER, f"Clean_Scan_{timestamp}.pcd")
+    filename = os.path.join(OUTPUT_FOLDER, f"Object_{timestamp}.pcd")
 
-    print(f"\n\n💾 Saving Cleaned File: {filename}...")
+    print(f"\n\n💾 Saving Object Scan: {filename}...")
     points_list = list(unique_points)
-    print(f"📊 Total Voxelized Points: {len(points_list)}")
 
-    header = f"""# .PCD v0.7 - Clean Voxel Scan
+    # Simple Despeckling: Remove points with no neighbors (Optional optimization)
+    # For now, we save everything to ensure we don't delete the truck.
+
+    header = f"""# .PCD v0.7 - Object Scan
 VERSION 0.7
 FIELDS x y z
 SIZE 4 4 4
@@ -139,32 +147,26 @@ DATA ascii
     with open(filename, 'w') as f:
         f.write(header)
         for p in points_list:
-            # p is (x, y), add z=0
             f.write(f"{p[0]:.4f} {p[1]:.4f} 0.000\n")
 
-    print("✅ Save Complete!")
+    print(f"✅ Saved {len(points_list)} points.")
 
 
 def parse_packet(packet):
-    # Standard RPLIDAR A1/A2 parser
     try:
         lsn = packet[3]
         fsa = struct.unpack('<H', packet[4:6])[0]
         lsa = struct.unpack('<H', packet[6:8])[0]
-
         angle_fsa = (fsa >> 1) / 64.0
         angle_lsa = (lsa >> 1) / 64.0
-
         diff = angle_lsa - angle_fsa
         if diff < 0: diff += 360
         angle_step = diff / (lsn - 1) if lsn > 1 else 0
 
         parsed_points = []
         for i in range(lsn):
-            # Distance is in mm
             dist_val = struct.unpack('<H', packet[10 + 2 * i: 12 + 2 * i])[0]
             distance_mm = dist_val / 4.0
-
             if distance_mm > 0:
                 raw_angle = angle_fsa + (angle_step * i)
                 parsed_points.append((raw_angle, distance_mm))
@@ -181,17 +183,19 @@ if __name__ == "__main__":
     try:
         ser = serial.Serial(PORT, BAUD, timeout=1)
         ser.setDTR(True)
-        ser.write(b'\xA5\x60')  # Scan mode
+        ser.write(b'\xA5\x60')
         time.sleep(1.0)
         ser.reset_input_buffer()
 
-        print(f"🚀 High-Res Tracker Running on {PORT}")
-        print(f"🎯 Noise Tolerance: {NOISE_TOLERANCE * 100} cm")
-        print("⌨️  Press Ctrl+C to SAVE result.\n")
+        print(f"🚀 Robust Object Tracker on {PORT}")
+        print(f"🛡️  Wall Buffer: {NOISE_TOLERANCE * 100} cm")
+        print(f"👀 Search Window: +/- {SEARCH_WINDOW} bins")
+        print("⌨️  Press Ctrl+C to STOP and SAVE.\n")
 
         buffer = b''
         last_raw_angle = 0.0
         rotation_count = 0
+        points_captured_this_frame = 0
 
         while True:
             if ser.in_waiting:
@@ -209,52 +213,44 @@ if __name__ == "__main__":
                         new_data = parse_packet(packet)
 
                         for (angle, dist_mm) in new_data:
-                            # 1. Normalize
                             norm_angle = angle % 360.0
                             dist_m = dist_mm / 1000.0
 
-                            # 2. Filter Blind Spots
-                            if dist_m < MIN_DIST_M: continue
+                            # 1. Filter Blind Spots & Max Range
+                            if dist_m < MIN_DIST_M or dist_m > 12.0: continue
 
-                            # 3. INTERPOLATED Background Check
-                            bg_dist_m = get_interpolated_bg_dist(norm_angle)
+                            # 2. ROBUST BACKGROUND CHECK
+                            # If it returns True, it is the wall (or close to it)
+                            if is_background(norm_angle, dist_m):
+                                continue
 
-                            if bg_dist_m:
-                                # We only care if the object is CLOSER than the wall
-                                # (dist_m < bg - tolerance)
-                                # This removes "ghosts" behind the wall
-                                if dist_m < (bg_dist_m - NOISE_TOLERANCE):
-                                    # Convert to Cartesian
-                                    ang_rad = math.radians(norm_angle)
-                                    x = dist_m * math.cos(ang_rad)
-                                    y = dist_m * math.sin(ang_rad)
+                                # 3. If we are here, it is an OBJECT
+                            ang_rad = math.radians(norm_angle)
+                            x = dist_m * math.cos(ang_rad)
+                            y = dist_m * math.sin(ang_rad)
 
-                                    # 4. VOXEL GRID SNAP (The "Clarity" Fix)
-                                    # Round to nearest VOXEL_SIZE (e.g., 5mm)
-                                    # This forces scattered points into a single coordinate
-                                    x_snap = round(x / VOXEL_SIZE) * VOXEL_SIZE
-                                    y_snap = round(y / VOXEL_SIZE) * VOXEL_SIZE
+                            # 4. Voxel Snap
+                            x_snap = round(x / VOXEL_SIZE) * VOXEL_SIZE
+                            y_snap = round(y / VOXEL_SIZE) * VOXEL_SIZE
 
-                                    all_dynamic_points_set.add((x_snap, y_snap))
+                            dynamic_points_set.add((x_snap, y_snap))
+                            points_captured_this_frame += 1
 
-                            # UI Updates
                             if (last_raw_angle - norm_angle) > 200:
                                 rotation_count += 1
                                 sys.stdout.write(
-                                    f"\r🔄 Rotations: {rotation_count} | 🧱 Voxel Points: {len(all_dynamic_points_set)}   ")
+                                    f"\r🔄 Scans: {rotation_count} | 🚛 Object Points: {len(dynamic_points_set)}   ")
                                 sys.stdout.flush()
+                                points_captured_this_frame = 0
 
                             last_raw_angle = norm_angle
-
                     else:
                         buffer = buffer[1:]
 
-            time.sleep(0.0005)
-
     except KeyboardInterrupt:
-        print("\n🛑 Stopping Hardware...")
+        print("\n🛑 Stopping...")
         if 'ser' in locals() and ser.is_open:
             ser.write(b'\xA5\x65')
             ser.close()
 
-        save_combined_file(all_dynamic_points_set)
+        save_combined_file(dynamic_points_set)
