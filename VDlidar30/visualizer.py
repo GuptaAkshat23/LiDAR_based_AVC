@@ -71,7 +71,8 @@ class MinimalLiDARViewer:
         )
         return file_path
 
-    def style_pcd(self, pcd):
+    def style_pcd(self, pcd):\
+
         """Paint points Cyan (Blue-Green) to pop against black background"""
         pcd.paint_uniform_color([0, 1, 1])
 
