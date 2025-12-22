@@ -14,7 +14,7 @@ SAVE_DIRECTORY = "./scans"
 
 # --- 3D STACKING SETTINGS ---
 # Distance moved per full 360 rotation (e.g., 0.05m = 5cm)
-Z_INCREMENT_METERS = 0.05
+Z_INCREMENT_METERS = 0.0075
 
 all_points_buffer = []
 scan_counter = 0
