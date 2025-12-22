@@ -22,7 +22,7 @@ GRID_RESOLUTION = 0.05
 # 0.30 = 30%.
 # A point must appear in 30% of the frames to be saved.
 # This balances noise reduction with sensitivity.
-MIN_PERSISTENCE_RATIO = 0.30
+MIN_PERSISTENCE_RATIO = 0.10
 
 # Global storage for grid counting
 # Format: { (grid_x, grid_y): hit_count }
@@ -77,7 +77,7 @@ def save_filtered_pcd(grid_data, total_scans, output_folder):
     print(f"[SAVING] Writing {num_points} filtered points to {filename}...")
 
     with open(filename, 'w') as f:
-        f.write("# .PCD v.7 - LZR U921 30% Persistence Filter\n")
+        f.write("# .PCD v.7 - LZR U921 25% Persistence Filter\n")
         f.write("VERSION .7\n")
         f.write("FIELDS x y z\n")
         f.write("SIZE 4 4 4\n")
