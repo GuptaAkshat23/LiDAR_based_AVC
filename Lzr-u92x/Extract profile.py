@@ -1,97 +1,94 @@
+import tkinter as tk
+from tkinter import filedialog, messagebox
 import numpy as np
+import open3d as o3d
 import os
 
-# --- CONFIGURATION ---
-ZERO_PLANE_FILE = "zero_plane.npy"
-RAW_STACK_FILE = "raw_vehicle_stack.npy"
-OUTPUT_PCD = "room_test_profile.pcd"
 
-# PHYSICAL SETTINGS
-FOV_DEGREES = 96.0
-X_INCREMENT_METERS = 0.05
+def subtract_scans():
+    # Setup GUI
+    root = tk.Tk()
+    root.withdraw()
 
-# ROOM SPECIFIC SETTINGS
-MAX_RANGE_METERS = 20.0  # Hard limit for your room test
-TOLERANCE_MM = 100  # 10cm sensitivity (Better for room testing)
+    # 1. Select the OBJECT File (The scan with the car)
+    print("Select SIGNAL file (Car/Object)...")
+    sig_path = filedialog.askopenfilename(
+        title="Select Signal File",
+        filetypes=[("PCD", "*.pcd")]
+    )
+    if not sig_path: return
 
+    # 2. Select the ZERO PLANE File (The extruded background)
+    print("Select ZERO PLANE file...")
+    zero_path = filedialog.askopenfilename(
+        title="Select Zero Plane File",
+        filetypes=[("PCD", "*.pcd")]
+    )
+    if not zero_path: return
 
-def extract_profile():
-    print("--- STEP 3: PROCESSING (ROOM MODE) ---")
-
-    # 1. Load Data
     try:
-        zero_plane = np.load(ZERO_PLANE_FILE)
-        raw_stack = np.load(RAW_STACK_FILE)
-        print(f"Loaded Background (Zero Plane): {zero_plane.shape}")
-        print(f"Loaded Recording (Raw Stack):   {raw_stack.shape}")
-    except FileNotFoundError:
-        print("Error: Files not found. Run Step 1 and Step 2 first!")
-        return
+        print("Loading clouds...")
+        # Load clouds and keep 'nan' values so the grid stays aligned
+        sig_pcd = o3d.io.read_point_cloud(sig_path, remove_nan_points=False)
+        zero_pcd = o3d.io.read_point_cloud(zero_path, remove_nan_points=False)
 
-    final_points = []
+        # Convert to Numpy Arrays (Rows x Columns x 3)
+        sig_pts = np.asarray(sig_pcd.points)
+        zero_pts = np.asarray(zero_pcd.points)
 
-    # Pre-calculate angles
-    angles = np.linspace(np.radians(-FOV_DEGREES / 2), np.radians(FOV_DEGREES / 2), 274)
+        # CHECK: Are they the same size?
+        if sig_pts.shape != zero_pts.shape:
+            messagebox.showerror("Error",
+                                 f"Shape Mismatch!\n\n"
+                                 f"Signal Points: {sig_pts.shape[0]}\n"
+                                 f"Zero Points:   {zero_pts.shape[0]}\n\n"
+                                 f"Both files must use the exact same STACK_SIZE (e.g., 100)."
+                                 )
+            return
 
-    # 2. Iterate through every time-slice
-    for time_idx, frame in enumerate(raw_stack):
+        print("Computing difference...")
 
-        # --- A. RANGE FILTER ---
-        # Convert to meters for checking range
-        frame_meters = frame / 1000.0
+        # --- THE MAGIC LOGIC ---
+        # We calculate the distance between the Car Scan and the Empty Floor.
+        # axis=1 means we check X, Y, and Z differences for every point.
+        differences = sig_pts - zero_pts
 
-        # Create a mask for points within 20m
-        valid_range_mask = (frame_meters > 0.1) & (frame_meters < MAX_RANGE_METERS)
+        # Calculate the "Magnitude" of the difference (Distance in meters)
+        # This tells us how far the point moved from the zero state.
+        dist_diff = np.linalg.norm(differences, axis=1)
 
-        # --- B. BACKGROUND FILTER (Zero Plane) ---
-        # Calculate difference from the wall/background
-        diff = np.abs(frame - zero_plane)
+        # THRESHOLD: How much change counts as an object?
+        # 0.05 meters = 5 cm. Any change less than 5cm is considered "Noise/Floor".
+        threshold = 0.05
 
-        # Logic:
-        # 1. Point must be within 20m
-        # 2. Point must be DIFFERENT from the wall (> 10cm change)
-        # 3. Point must be CLOSER than the wall (frame < zero_plane)
-        is_object = valid_range_mask & (diff > TOLERANCE_MM) & (frame < zero_plane)
+        # Create the Final Output
+        # We take the ORIGINAL Signal points...
+        final_pts = sig_pts.copy()
 
-        # Extract valid object data
-        object_ranges = frame_meters[is_object]
-        object_angles = angles[is_object]
+        # ...and we set the "Floor Points" to NaN (Invisible)
+        # Logic: If the difference is SMALL, it's floor -> Delete it.
+        # Logic: If the difference is BIG, it's car -> Keep it.
+        final_pts[dist_diff < threshold] = np.nan
 
-        # --- C. COORDINATE MAPPING ---
-        if len(object_ranges) > 0:
-            # X = Time (Movement)
-            x_coords = np.full(len(object_ranges), time_idx * X_INCREMENT_METERS)
+        # Save Result
+        print("Saving result...")
+        out_pcd = o3d.geometry.PointCloud()
+        out_pcd.points = o3d.utility.Vector3dVector(final_pts)
 
-            # Y = Width/Depth (Distance from sensor)
-            y_coords = object_ranges * np.cos(object_angles)
+        save_path = filedialog.asksaveasfilename(
+            title="Save Clean Output",
+            initialfile="clean_object_scan.pcd",
+            defaultextension=".pcd"
+        )
 
-            # Z = Height (Vertical position)
-            z_coords = object_ranges * np.sin(object_angles)
+        if save_path:
+            o3d.io.write_point_cloud(save_path, out_pcd)
+            messagebox.showinfo("Success", f"Clean file saved!\n\nFloor points removed.")
 
-            # Stack and add to list
-            points = np.column_stack((x_coords, y_coords, z_coords))
-            final_points.extend(points)
-
-    save_pcd(final_points, OUTPUT_PCD)
-
-
-def save_pcd(points, filename):
-    num = len(points)
-    print(f"\n[RESULT] Extracted {num} points within 20m range.")
-
-    if num == 0:
-        print("Warning: No object detected. (Did you move in front of the sensor?)")
-        return
-
-    with open(filename, 'w') as f:
-        f.write("# .PCD v.7 - Room Test Profile\n")
-        f.write("VERSION .7\nFIELDS x y z\nSIZE 4 4 4\nTYPE F F F\nCOUNT 1 1 1\n")
-        f.write(f"WIDTH {num}\nHEIGHT 1\nVIEWPOINT 0 0 0 1 0 0 0\nPOINTS {num}\nDATA ascii\n")
-        for p in points:
-            f.write(f"{p[0]:.4f} {p[1]:.4f} {p[2]:.4f}\n")
-
-    print(f"Saved to: {os.path.abspath(filename)}")
+    except Exception as e:
+        messagebox.showerror("Error", str(e))
+        print(f"Error: {e}")
 
 
 if __name__ == "__main__":
-    extract_profile()
+    subtract_scans()

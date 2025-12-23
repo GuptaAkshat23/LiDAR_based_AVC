@@ -3,146 +3,176 @@ import time
 import numpy as np
 import datetime
 import os
-import sys
+import struct
+import open3d as o3d
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
-SERIAL_PORT = 'COM5'  # <--- Make sure this matches the Port Finder result (COM4 or COM5)
-BAUD_RATE = 460800  # <--- WARNING: Auto-Tuner found 921600. Change this if you see garbage.
-POINTS_PER_SCAN = 274
+SERIAL_PORT = 'COM4'  # Ensure this matches your setup
+BAUD_RATE = 460800
+POINTS_PER_SCAN = 274  # U921 resolution
 FOV_DEGREES = 96.0
-SAVE_DIRECTORY = "./scans"
 
-# 3D SETTINGS
-Z_INCREMENT_METERS = 0.05
+# IMPORTANT: These must match your 'lzr_capture_organized.py' settings!
+# This ensures the Zero file is the exact same shape as your Object file.
+STACK_SIZE = 100
+SIMULATED_SPEED = 0.05
 
-# Buffers
-all_points_buffer = []
-scan_counter = 0
+# How many frames to read to calculate the average background?
+CALIBRATION_FRAMES = 300
 
-
-def save_combined_pcd(points_list, output_folder):
-    if not points_list:
-        print("\n[WARNING] No points to save.")
-        return
-
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
-
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = os.path.join(output_folder, f"lzr_sideways_3d_{timestamp}.pcd")
-    num_points = len(points_list)
-
-    print(f"\n\n[SAVING] Writing {num_points} points to {filename}...")
-
-    with open(filename, 'w') as f:
-        f.write("# .PCD v.7 - LZR U921 Sideways Scan\n")
-        f.write("VERSION .7\nFIELDS x y z\nSIZE 4 4 4\nTYPE F F F\nCOUNT 1 1 1\n")
-        f.write(f"WIDTH {num_points}\nHEIGHT 1\nVIEWPOINT 0 0 0 1 0 0 0\nPOINTS {num_points}\nDATA ascii\n")
-        for p in points_list:
-            f.write(f"{p[0]:.4f} {p[1]:.4f} {p[2]:.4f}\n")
-
-    print(f"[COMPLETE] File saved successfully.")
+SYNC_WORD = b'\xfc\xfd\xfe\xff'
 
 
-def process_scan(distances_mm):
-    global scan_counter
-    current_length = scan_counter * Z_INCREMENT_METERS
-    angles = np.linspace(np.radians(-FOV_DEGREES / 2), np.radians(FOV_DEGREES / 2), len(distances_mm))
-
-    for r, theta in zip(distances_mm, angles):
-        r_meters = r / 1000.0
-        # Filter range: 0.1m to 60m
-        if 0.1 < r_meters < 60.0:
-            raw_x = r_meters * np.cos(theta)
-            raw_y = r_meters * np.sin(theta)
-
-            # Mapping: X=Time, Y=Width, Z=Height
-            x_world = current_length
-            y_world = abs(raw_x)
-            z_world = raw_y
-
-            all_points_buffer.append((x_world, y_world, z_world))
-
-    scan_counter += 1
+# ==========================================
+# PARSING LOGIC (Same as Reader)
+# ==========================================
+def parse_frame_distances(payload):
+    if len(payload) < POINTS_PER_SCAN * 2:
+        return None
+    return [struct.unpack('<H', payload[i:i + 2])[0] for i in range(0, POINTS_PER_SCAN * 2, 2)]
 
 
-def run_recorder():
-    global scan_counter
-    print("--- LZR U921 RECORDER (WITH LIVE ANALYTICS) ---")
-    print(f"Target: {SERIAL_PORT} @ {BAUD_RATE}")
-    print("Press Ctrl+C to stop and save.\n")
+# ==========================================
+# GENERATION LOGIC
+# ==========================================
+def save_extruded_zero_plane(avg_distances, output_filename):
+    """
+    Takes 1 "Perfect" row of distances and duplicates it STACK_SIZE times
+    to create a full reference block compatible with the object scanner.
+    """
+    print(f"Generating Zero Reference from average data...")
 
+    width = POINTS_PER_SCAN
+    height = STACK_SIZE
+    total_points = width * height
+
+    angles = np.linspace(np.radians(-FOV_DEGREES / 2), np.radians(FOV_DEGREES / 2), width)
+
+    # Pre-calculate X and Z for the single averaged row
+    # (Since the sensor is stationary, X and Z don't change, only Y changes over time)
+    base_row_x = []
+    base_row_z = []
+
+    for r_mm, theta in zip(avg_distances, angles):
+        r_meters = r_mm / 1000.0
+
+        if 0.1 < r_meters < 65.0:
+            x = r_meters * np.sin(theta)
+            z = r_meters * np.cos(theta)
+            base_row_x.append(x)
+            base_row_z.append(z)
+        else:
+            base_row_x.append(np.nan)
+            base_row_z.append(np.nan)
+
+    # Now generate the full file lines
+    data_lines = []
+
+    for frame_idx in range(height):
+        # Calculate Y for this row (Time/Movement dimension)
+        y_pos = frame_idx * SIMULATED_SPEED
+
+        # Write the row
+        for i in range(width):
+            x = base_row_x[i]
+            z = base_row_z[i]
+
+            if np.isnan(x):
+                data_lines.append("nan nan nan")
+            else:
+                # Note: We keep X and Z constant (perfect floor), only Y increments
+                data_lines.append(f"{x:.4f} {y_pos:.4f} {z:.4f}")
+
+    # Save to PCD
+    with open(output_filename, 'w') as f:
+        f.write("# .PCD v.7 - LZR Zero Reference\n")
+        f.write("VERSION .7\n")
+        f.write("FIELDS x y z\n")
+        f.write("SIZE 4 4 4\n")
+        f.write("TYPE F F F\n")
+        f.write("COUNT 1 1 1\n")
+        f.write(f"WIDTH {width}\n")
+        f.write(f"HEIGHT {height}\n")
+        f.write("VIEWPOINT 0 0 0 1 0 0 0\n")
+        f.write(f"POINTS {total_points}\n")
+        f.write("DATA ascii\n")
+        f.write("\n".join(data_lines))
+
+    print(f"SUCCESS! Zero Plane saved to: {output_filename}")
+
+
+# ==========================================
+# MAIN RECORDING LOOP
+# ==========================================
+def record_background():
     try:
-        ser = serial.Serial(port=SERIAL_PORT, baudrate=BAUD_RATE, timeout=1)
-        print("Connected. Waiting for stream...")
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
+        print(f"Connected to LZR U921 on {SERIAL_PORT}")
+        print(f"Ensure the detection area is EMPTY.")
+        print(f"Calibrating background using {CALIBRATION_FRAMES} frames...")
 
         buffer = b""
+        accumulator = np.zeros(POINTS_PER_SCAN)
+        counts = np.zeros(POINTS_PER_SCAN)
+        frames_captured = 0
 
-        # ANALYTICS VARIABLES
-        start_time = time.time()
-        byte_counter = 0
-        last_print = time.time()
+        while frames_captured < CALIBRATION_FRAMES:
+            if ser.in_waiting:
+                buffer += ser.read(ser.in_waiting)
 
-        while True:
-            if ser.in_waiting > 0:
-                chunk = ser.read(ser.in_waiting)
-                buffer += chunk
-                byte_counter += len(chunk)
+                while SYNC_WORD in buffer:
+                    parts = buffer.split(SYNC_WORD, 1)
+                    if len(parts) > 1:
+                        buffer = parts[1]
+                        if len(buffer) < 4:
+                            buffer = SYNC_WORD + buffer
+                            break
 
-                # --- PARSING ---
-                start_index = buffer.find(b'\x02')
-                if start_index != -1:
-                    buffer = buffer[start_index:]
-                    EXPECTED_SIZE = (POINTS_PER_SCAN * 2) + 10  # Approx frame size
+                        msg_size = struct.unpack('<H', buffer[0:2])[0]
+                        total_expected = 4 + msg_size + 2
 
-                    if len(buffer) >= EXPECTED_SIZE:
-                        # Extract Payload
-                        raw_payload = buffer[4: 4 + (POINTS_PER_SCAN * 2)]
+                        if len(buffer) >= total_expected:
+                            frame_data = buffer[:total_expected]
+                            buffer = buffer[total_expected:]
+                            payload = frame_data[4:-2]
 
-                        # Verify integrity (simple check)
-                        if len(raw_payload) == (POINTS_PER_SCAN * 2):
-                            distances = []
-                            # Big Endian Decoding
-                            for i in range(0, len(raw_payload) - 1, 2):
-                                high = raw_payload[i]
-                                low = raw_payload[i + 1]
-                                dist = (high << 8) + low
-                                distances.append(dist)
+                            dists = parse_frame_distances(payload)
 
-                            process_scan(distances)
+                            if dists and len(dists) == POINTS_PER_SCAN:
+                                # Convert to numpy for easier math
+                                dist_arr = np.array(dists)
 
-                        # Move buffer forward
-                        buffer = buffer[EXPECTED_SIZE:]
+                                # Filter invalid (0 or max) before adding
+                                valid_mask = (dist_arr > 100) & (dist_arr < 65000)
 
-            # --- LIVE DASHBOARD (Updates every 0.2s) ---
-            if time.time() - last_print > 0.2:
-                elapsed = time.time() - start_time
-                if elapsed > 0:
-                    fps = scan_counter / elapsed
-                    kbps = (byte_counter / 1024) / elapsed
+                                accumulator[valid_mask] += dist_arr[valid_mask]
+                                counts[valid_mask] += 1
 
-                    # \r overwrites the current line
-                    sys.stdout.write(
-                        f"\r[REC] Frames: {scan_counter} | "
-                        f"Points: {len(all_points_buffer)} | "
-                        f"FPS: {fps:.1f} | "
-                        f"Data: {kbps:.1f} KB/s   "
-                    )
-                    sys.stdout.flush()
-                    last_print = time.time()
+                                frames_captured += 1
+                                if frames_captured % 50 == 0:
+                                    print(f"Captured {frames_captured}/{CALIBRATION_FRAMES} frames...")
+                        else:
+                            buffer = SYNC_WORD + buffer
+                            break
+                    else:
+                        break
 
-            time.sleep(0.001)
+        # Calculate Average
+        # Avoid divide by zero if a point was never seen (set to 0)
+        counts[counts == 0] = 1
+        avg_distances = accumulator / counts
 
-    except serial.SerialException:
-        print(f"\n[ERROR] Could not open {SERIAL_PORT}.")
-    except KeyboardInterrupt:
-        print("\n\n[STOP] Recording stopped by user.")
+        # Save output
+        save_extruded_zero_plane(avg_distances, "zero_ref.pcd")
+
+    except Exception as e:
+        print(f"Error: {e}")
     finally:
-        if 'ser' in locals() and ser.is_open: ser.close()
-        save_combined_pcd(all_points_buffer, SAVE_DIRECTORY)
+        if 'ser' in locals() and ser.is_open:
+            ser.close()
 
 
 if __name__ == "__main__":
-    run_recorder()
+    record_background()
