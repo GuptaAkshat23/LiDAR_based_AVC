@@ -1,178 +1,240 @@
 import serial
+import math
 import time
-import numpy as np
-import datetime
-import os
 import struct
-import open3d as o3d
+import sys
+import statistics
+import os
 
-# ==========================================
-# CONFIGURATION
-# ==========================================
-SERIAL_PORT = 'COM4'  # Ensure this matches your setup
-BAUD_RATE = 460800
-POINTS_PER_SCAN = 274  # U921 resolution
-FOV_DEGREES = 96.0
+# --- CONFIGURATION ---
+PORT = 'COM3'  # Adjust to your RS-485 Adapter Port
+BAUD = 460800  # Standard LZR-U921 Baud Rate
+ANGLE_BIN_SIZE = 0.5  # Resolution in degrees for the output file
+OUTPUT_FOLDER = "scans"
 
-# IMPORTANT: These must match your 'lzr_capture_organized.py' settings!
-# This ensures the Zero file is the exact same shape as your Object file.
-STACK_SIZE = 100
-SIMULATED_SPEED = 0.05
+# --- LZR CONSTANTS ---
+# Sync Header: 0xFFFEFDFC (Little Endian -> FC FD FE FF)
+LZR_SYNC = b'\xFC\xFD\xFE\xFF'
+CMD_MDI = 50011  # Command code for Measurement Data [cite: 320]
+FOV_START = -48.0  # Starting angle in degrees [cite: 209]
+FOV_END = 48.0  # Ending angle in degrees [cite: 216]
+POINTS_PER_PLANE = 274  # Max points per plane [cite: 207]
 
-# How many frames to read to calculate the average background?
-CALIBRATION_FRAMES = 300
+# Calculate angular step: 96 degrees / 273 steps ~= 0.3516 degrees
+ANGLE_STEP = (FOV_END - FOV_START) / (POINTS_PER_PLANE - 1)
 
-SYNC_WORD = b'\xfc\xfd\xfe\xff'
-
-
-# ==========================================
-# PARSING LOGIC (Same as Reader)
-# ==========================================
-def parse_frame_distances(payload):
-    if len(payload) < POINTS_PER_SCAN * 2:
-        return None
-    return [struct.unpack('<H', payload[i:i + 2])[0] for i in range(0, POINTS_PER_SCAN * 2, 2)]
+# --- GLOBAL STORAGE ---
+polar_bins = {}
 
 
-# ==========================================
-# GENERATION LOGIC
-# ==========================================
-def save_extruded_zero_plane(avg_distances, output_filename):
+def get_bin_index(angle):
+    """Converts an angle into a bin index based on resolution."""
+    return int(angle / ANGLE_BIN_SIZE)
+
+
+def save_single_zero_plane(bins, filename="lzr_zero_plane.pcd"):
     """
-    Takes 1 "Perfect" row of distances and duplicates it STACK_SIZE times
-    to create a full reference block compatible with the object scanner.
+    Computes the MEDIAN distance for each bin and saves a PCD file.
     """
-    print(f"Generating Zero Reference from average data...")
+    clean_points = []
+    print(f"\n\n🛑 Stopping... Analyzing {len(bins)} angle segments...")
+    print("   Computing Median (Statistical Background Model)... please wait.")
 
-    width = POINTS_PER_SCAN
-    height = STACK_SIZE
-    total_points = width * height
+    if not os.path.exists(OUTPUT_FOLDER):
+        try:
+            os.makedirs(OUTPUT_FOLDER)
+        except OSError as e:
+            print(f"❌ Error creating folder: {e}")
+            return
 
-    angles = np.linspace(np.radians(-FOV_DEGREES / 2), np.radians(FOV_DEGREES / 2), width)
+    for bin_idx, distances in bins.items():
+        if len(distances) > 0:
+            median_dist = statistics.median(distances)
 
-    # Pre-calculate X and Z for the single averaged row
-    # (Since the sensor is stationary, X and Z don't change, only Y changes over time)
-    base_row_x = []
-    base_row_z = []
+            # Reconstruct X, Y from the Bin Angle and Median Distance
+            angle_center = (bin_idx * ANGLE_BIN_SIZE) + (ANGLE_BIN_SIZE / 2)
+            angle_rad = math.radians(angle_center)
 
-    for r_mm, theta in zip(avg_distances, angles):
-        r_meters = r_mm / 1000.0
+            # Convert mm to meters
+            x = (median_dist / 1000.0) * math.cos(angle_rad)
+            y = (median_dist / 1000.0) * math.sin(angle_rad)
 
-        if 0.1 < r_meters < 65.0:
-            x = r_meters * np.sin(theta)
-            z = r_meters * np.cos(theta)
-            base_row_x.append(x)
-            base_row_z.append(z)
-        else:
-            base_row_x.append(np.nan)
-            base_row_z.append(np.nan)
+            # LZR is often mounted vertically or looking down; Z is 0 for this projection
+            clean_points.append((x, y))
 
-    # Now generate the full file lines
-    data_lines = []
+    if not clean_points:
+        print("❌ Error: No valid points to save.")
+        return
 
-    for frame_idx in range(height):
-        # Calculate Y for this row (Time/Movement dimension)
-        y_pos = frame_idx * SIMULATED_SPEED
+    full_path = os.path.join(OUTPUT_FOLDER, filename)
 
-        # Write the row
-        for i in range(width):
-            x = base_row_x[i]
-            z = base_row_z[i]
-
-            if np.isnan(x):
-                data_lines.append("nan nan nan")
-            else:
-                # Note: We keep X and Z constant (perfect floor), only Y increments
-                data_lines.append(f"{x:.4f} {y_pos:.4f} {z:.4f}")
-
-    # Save to PCD
-    with open(output_filename, 'w') as f:
-        f.write("# .PCD v.7 - LZR Zero Reference\n")
-        f.write("VERSION .7\n")
-        f.write("FIELDS x y z\n")
-        f.write("SIZE 4 4 4\n")
-        f.write("TYPE F F F\n")
-        f.write("COUNT 1 1 1\n")
-        f.write(f"WIDTH {width}\n")
-        f.write(f"HEIGHT {height}\n")
-        f.write("VIEWPOINT 0 0 0 1 0 0 0\n")
-        f.write(f"POINTS {total_points}\n")
-        f.write("DATA ascii\n")
-        f.write("\n".join(data_lines))
-
-    print(f"SUCCESS! Zero Plane saved to: {output_filename}")
-
-
-# ==========================================
-# MAIN RECORDING LOOP
-# ==========================================
-def record_background():
+    header = f"""# .PCD v0.7 - Point Cloud Data file format
+VERSION 0.7
+FIELDS x y z
+SIZE 4 4 4
+TYPE F F F
+COUNT 1 1 1
+WIDTH {len(clean_points)}
+HEIGHT 1
+VIEWPOINT 0 0 0 1 0 0 0
+POINTS {len(clean_points)}
+DATA ascii
+"""
     try:
-        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
-        print(f"Connected to LZR U921 on {SERIAL_PORT}")
-        print(f"Ensure the detection area is EMPTY.")
-        print(f"Calibrating background using {CALIBRATION_FRAMES} frames...")
+        with open(full_path, 'w') as f:
+            f.write(header)
+            for p in clean_points:
+                f.write(f"{p[0]:.3f} {p[1]:.3f} 0.000\n")
+        print(f"✅ SUCCESS: Saved '{full_path}' with {len(clean_points)} static points.")
+    except Exception as e:
+        print(f"❌ File Write Error: {e}")
 
-        buffer = b""
-        accumulator = np.zeros(POINTS_PER_SCAN)
-        counts = np.zeros(POINTS_PER_SCAN)
-        frames_captured = 0
 
-        while frames_captured < CALIBRATION_FRAMES:
+def parse_lzr_packet(payload):
+    """
+    Decodes LZR-U921 payload.
+    Assumes payload contains [CMD, Options..., Plane, MDI].
+    We look for the MDI block at the end of the payload.
+    """
+    try:
+        # 1. Check Command [cite: 319]
+        # CMD is the first 2 bytes of the message
+        cmd = struct.unpack('<H', payload[:2])[0]
+        if cmd != CMD_MDI:
+            return []
+
+        # 2. Extract MDI Data
+        # The MDI (distances) is always at the end of the message[cite: 301].
+        # Length is 274 points * 2 bytes = 548 bytes.
+        mdi_len = POINTS_PER_PLANE * 2
+
+        if len(payload) < mdi_len + 2:  # +2 for CMD
+            return []
+
+        # Take the last 548 bytes as the distance data
+        raw_distances = payload[-mdi_len:]
+
+        parsed_data = []
+
+        for i in range(POINTS_PER_PLANE):
+            # Extract 2-byte distance (mm) [cite: 380]
+            dist_mm = struct.unpack('<H', raw_distances[i * 2: i * 2 + 2])[0]
+
+            # Calculate Angle (Curtain -48 to +48) [cite: 213]
+            current_angle = FOV_START + (i * ANGLE_STEP)
+
+            # LZR Max Range is 65m (65000mm). Filter invalid/max points if needed.
+            if 0 < dist_mm < 65000:
+                parsed_data.append((current_angle, dist_mm))
+
+        return parsed_data
+
+    except Exception as e:
+        print(f"Parse Error: {e}")
+        return []
+
+
+def verify_checksum(message, received_chk):
+    """
+    Calculates checksum: Sum of all bytes of the message part[cite: 285].
+    """
+    calc_sum = sum(message) & 0xFFFF  # Keep it 16-bit
+    return calc_sum == received_chk
+
+
+# --- MAIN LOOP ---
+if __name__ == "__main__":
+    try:
+        # Initialize Serial [cite: 236]
+        ser = serial.Serial(PORT, BAUD, timeout=0.1)
+        ser.reset_input_buffer()
+
+        print(f"🚀 Connecting to LZR-U921 on {PORT} @ {BAUD} bps")
+        print(f"📂 Output will be saved to: ./{OUTPUT_FOLDER}/")
+        print("💡 Recording... Press CTRL+C to stop and save.")
+        print("-" * 50)
+
+        buffer = b''
+        frame_count = 0
+        points_accumulated = 0
+
+        while True:
+            # Read chunks of data
             if ser.in_waiting:
                 buffer += ser.read(ser.in_waiting)
 
-                while SYNC_WORD in buffer:
-                    parts = buffer.split(SYNC_WORD, 1)
-                    if len(parts) > 1:
-                        buffer = parts[1]
-                        if len(buffer) < 4:
-                            buffer = SYNC_WORD + buffer
-                            break
+            # Search for Sync Header FC FD FE FF
+            if len(buffer) < 8:  # Min size for Header
+                time.sleep(0.001)
+                continue
 
-                        msg_size = struct.unpack('<H', buffer[0:2])[0]
-                        total_expected = 4 + msg_size + 2
+            sync_idx = buffer.find(LZR_SYNC)
 
-                        if len(buffer) >= total_expected:
-                            frame_data = buffer[:total_expected]
-                            buffer = buffer[total_expected:]
-                            payload = frame_data[4:-2]
+            if sync_idx == -1:
+                # Keep last few bytes in case sync is split
+                buffer = buffer[-3:]
+                continue
 
-                            dists = parse_frame_distances(payload)
+            # Align buffer to Sync
+            buffer = buffer[sync_idx:]
 
-                            if dists and len(dists) == POINTS_PER_SCAN:
-                                # Convert to numpy for easier math
-                                dist_arr = np.array(dists)
+            if len(buffer) < 6:  # Need Sync(4) + Size(2)
+                continue
 
-                                # Filter invalid (0 or max) before adding
-                                valid_mask = (dist_arr > 100) & (dist_arr < 65000)
+            # Read Message Size [cite: 266]
+            # SIZE is bytes 4-5 (Little Endian)
+            msg_size = struct.unpack('<H', buffer[4:6])[0]
 
-                                accumulator[valid_mask] += dist_arr[valid_mask]
-                                counts[valid_mask] += 1
+            # Total Frame = Sync(4) + Size(2) + Message(msg_size) + Checksum(2)
+            total_len = 4 + 2 + msg_size + 2
 
-                                frames_captured += 1
-                                if frames_captured % 50 == 0:
-                                    print(f"Captured {frames_captured}/{CALIBRATION_FRAMES} frames...")
-                        else:
-                            buffer = SYNC_WORD + buffer
-                            break
-                    else:
-                        break
+            if len(buffer) < total_len:
+                continue  # Wait for more data
 
-        # Calculate Average
-        # Avoid divide by zero if a point was never seen (set to 0)
-        counts[counts == 0] = 1
-        avg_distances = accumulator / counts
+            # Extract Full Packet
+            packet = buffer[:total_len]
+            buffer = buffer[total_len:]  # Advance buffer
 
-        # Save output
-        save_extruded_zero_plane(avg_distances, "zero_ref.pcd")
+            # Parse Components
+            # Header = packet[0:6]
+            message_body = packet[6: 6 + msg_size]
+            checksum_bytes = packet[6 + msg_size: 6 + msg_size + 2]
 
-    except Exception as e:
-        print(f"Error: {e}")
-    finally:
+            received_chk = struct.unpack('<H', checksum_bytes)[0]
+
+            # Verify Integrity
+            if verify_checksum(message_body, received_chk):
+
+                # Decode Distances
+                new_data = parse_lzr_packet(message_body)
+
+                if new_data:
+                    frame_count += 1
+                    for (angle, distance) in new_data:
+                        # Binning
+                        b_idx = get_bin_index(angle)
+                        if b_idx not in polar_bins:
+                            polar_bins[b_idx] = []
+                        polar_bins[b_idx].append(distance)
+                        points_accumulated += 1
+
+                    # Live Status
+                    if frame_count % 10 == 0:
+                        sys.stdout.write(
+                            f"\r[LZR-U921] Frames: {frame_count} | "
+                            f"Total Pts: {points_accumulated} "
+                        )
+                        sys.stdout.flush()
+            else:
+                # Checksum failed, just skip this packet
+                pass
+
+    except KeyboardInterrupt:
         if 'ser' in locals() and ser.is_open:
             ser.close()
 
+        # PROCESS AND SAVE DATA
+        save_single_zero_plane(polar_bins)
 
-if __name__ == "__main__":
-    record_background()
+    except Exception as e:
+        print(f"\nError: {e}")
