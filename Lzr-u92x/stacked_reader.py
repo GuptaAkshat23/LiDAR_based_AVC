@@ -18,7 +18,7 @@ MIN_RANGE_M = 0.10
 MAX_RANGE_M = 3.00
 
 Z_INCREMENT = 0.05   # 5 cm per scan
-MAX_SCANS = 200      # set None to run until CTRL+C
+MAX_SCANS = 200     # set None to run until CTRL+C
 
 SYNC_HEADER = b'\xfc\xfd\xfe\xff'
 
