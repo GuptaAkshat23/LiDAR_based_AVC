@@ -7,67 +7,103 @@ import os
 import sys
 
 # --- CONFIGURATION ---
-SERIAL_PORT = 'COM4'  # Adjust this to your actual port
-BAUD_RATE = 921600  # Standard LZR Baud
-OUTPUT_FILENAME = "lzr_zero_plane.pcd"
+SERIAL_PORT = 'COM4'
+BAUD_RATE = 921600
+OUTPUT_FILENAME = "lzr_zero_plane_clean.pcd"
 
-# --- LZR SPECIFIC CONSTANTS ---
-START_ANGLE = -48.0  # Degrees
-ANGULAR_RES = 0.3516  # Degrees per step
+# --- LZR U921 CONSTANTS ---
+START_ANGLE = -48.0
+ANGULAR_RES = 0.3516
 SYNC_HEADER = b'\xfc\xfd\xfe\xff'
 
-# --- GLOBAL STORAGE ---
-# Stores lists of distances for each beam index
-# Format: { beam_index_0: [d1, d2...], beam_index_1: [d1, d2...] }
+# --- FILTERING LIMITS (VERY IMPORTANT) ---
+MIN_RANGE_M = 0.10     # Ignore anything closer than 10 cm
+MAX_RANGE_M = 3.00     # Your box max dimension (adjust if needed)
+MAX_NEIGHBOR_JUMP = 0.15  # 15 cm allowed jump between beams
+
 beam_history = {}
 
 
+# ----------------------------------------------------
+# ROBUST STATISTICS (MAD FILTER)
+# ----------------------------------------------------
+def robust_median(distances):
+    """
+    Removes outliers using Median Absolute Deviation (MAD)
+    """
+    if len(distances) < 5:
+        return None
+
+    median = statistics.median(distances)
+    deviations = [abs(d - median) for d in distances]
+    mad = statistics.median(deviations)
+
+    if mad == 0:
+        return median
+
+    # Keep points within 3 * MAD
+    filtered = [d for d in distances if abs(d - median) <= 3 * mad]
+
+    if not filtered:
+        return None
+
+    return statistics.median(filtered)
+
+
+# ----------------------------------------------------
+# SAVE CLEAN ZERO PLANE
+# ----------------------------------------------------
 def save_statistical_pcd(history, filename):
-    """
-    Calculates the MEDIAN distance for each beam index to create
-    a noise-free background model and saves it to PCD.
-    """
-    if not history:
-        print("❌ No data collected.")
-        return
+    print("\n🛑 Processing Zero Plane with Outlier Removal...")
 
-    print(f"\n\n🛑 Stopping... Analyzing data from {len(history)} beams...")
-    print("   Computing Median (Statistical Background Model)... please wait.")
+    beam_points = {}
 
+    # STEP 1: Robust median per beam
+    for idx in sorted(history.keys()):
+        dlist = history[idx]
+        robust_mm = robust_median(dlist)
+
+        if robust_mm is None:
+            continue
+
+        dist_m = robust_mm / 1000.0
+
+        if dist_m < MIN_RANGE_M or dist_m > MAX_RANGE_M:
+            continue
+
+        angle_deg = START_ANGLE + idx * ANGULAR_RES
+        angle_rad = np.radians(angle_deg)
+
+        x = dist_m * np.cos(angle_rad)
+        y = dist_m * np.sin(angle_rad)
+
+        beam_points[idx] = (x, y, 0.0)
+
+    # STEP 2: Neighbor consistency filtering
     clean_points = []
+    sorted_idx = sorted(beam_points.keys())
 
-    # Sort by index to keep points ordered in the file
-    sorted_indices = sorted(history.keys())
+    for i, idx in enumerate(sorted_idx):
+        x, y, z = beam_points[idx]
 
-    for idx in sorted_indices:
-        dist_list = history[idx]
+        if i > 0 and i < len(sorted_idx) - 1:
+            prev_dist = np.linalg.norm(beam_points[sorted_idx[i - 1]][:2])
+            curr_dist = np.linalg.norm((x, y))
+            next_dist = np.linalg.norm(beam_points[sorted_idx[i + 1]][:2])
 
-        if dist_list:
-            # 1. Compute Median Distance (Removes moving objects/noise)
-            median_dist_mm = statistics.median(dist_list)
+            if (abs(curr_dist - prev_dist) > MAX_NEIGHBOR_JUMP and
+                abs(curr_dist - next_dist) > MAX_NEIGHBOR_JUMP):
+                continue  # isolated spike → remove
 
-            # 2. Convert to Coordinates (Polar -> Cartesian)
-            # Only keep points that are valid (e.g., > 0)
-            if median_dist_mm > 0:
-                angle_deg = START_ANGLE + (idx * ANGULAR_RES)
-                angle_rad = np.radians(angle_deg)
-
-                # Convert mm to meters
-                dist_m = median_dist_mm / 1000.0
-
-                x = dist_m * np.cos(angle_rad)
-                y = dist_m * np.sin(angle_rad)
-
-                # Z is always 0 for the zero plane
-                clean_points.append((x, y, 0.0))
+        clean_points.append((x, y, z))
 
     if not clean_points:
-        print("❌ Error: No valid points computed.")
+        print("❌ No clean points generated.")
         return
 
-    # 3. Write PCD File
+    # STEP 3: Write PCD
     header = (
-        "# .PCD v0.7 - Zero Plane Data\n"
+        "# .PCD v0.7 - LZR U921 Clean Zero Plane\n"
         "VERSION 0.7\n"
         "FIELDS x y z\n"
         "SIZE 4 4 4\n"
@@ -80,89 +116,65 @@ def save_statistical_pcd(history, filename):
         "DATA ascii\n"
     )
 
-    try:
-        with open(filename, 'w') as f:
-            f.write(header)
-            for p in clean_points:
-                f.write(f"{p[0]:.4f} {p[1]:.4f} {p[2]:.4f}\n")
-        print(f"✅ SUCCESS: Saved '{filename}' with {len(clean_points)} static points.")
-    except Exception as e:
-        print(f"❌ File Write Error: {e}")
+    with open(filename, "w") as f:
+        f.write(header)
+        for p in clean_points:
+            f.write(f"{p[0]:.4f} {p[1]:.4f} {p[2]:.4f}\n")
+
+    print(f"✅ CLEAN ZERO PLANE SAVED → {filename}")
+    print(f"📊 Final Points: {len(clean_points)}")
 
 
+# ----------------------------------------------------
+# RAW DATA PARSING
+# ----------------------------------------------------
 def process_raw_data(data_bytes):
-    """Parses raw bytes and adds distances to history bins."""
-    # Based on your provided code: "Standard MDI starts after CMD... and optional Plane Number"
-    # data_bytes input here should be the RAW distance data (msg_body[3:])
-
     num_values = len(data_bytes) // 2
 
     for i in range(num_values):
-        # Read 2 bytes as unsigned short (distance in mm)
-        dist_mm = struct.unpack('<H', data_bytes[i * 2: i * 2 + 2])[0]
+        dist_mm = struct.unpack('<H', data_bytes[i*2:i*2+2])[0]
 
-        # Add to history for this specific beam index
-        if i not in beam_history:
-            beam_history[i] = []
+        if dist_mm == 0:
+            continue
 
-        # Filter out 0 or error codes if necessary (usually 0 is no return)
-        if dist_mm > 0:
-            beam_history[i].append(dist_mm)
+        beam_history.setdefault(i, []).append(dist_mm)
 
 
+# ----------------------------------------------------
+# MAIN LOOP
+# ----------------------------------------------------
 def main():
     try:
         ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-        print(f"🚀 Connected to LZR-U921 on {SERIAL_PORT}")
-        print("💡 Recording background... Keep the area clear if possible.")
-        print("⌨️  Press CTRL+C to STOP and save the Zero Plane.")
+        print("🚀 U921 Connected")
+        print("📦 Recording zero plane (press CTRL+C to stop)")
 
         scan_count = 0
 
         while True:
-            # 1. Look for Sync Header
-            # We read byte by byte to ensure we don't miss alignment
             if ser.read(1) == b'\xfc':
                 if ser.read(3) == b'\xfd\xfe\xff':
 
-                    # 2. Read Message Size
-                    size_bytes = ser.read(2)
-                    if len(size_bytes) < 2: continue
-                    msg_size = struct.unpack('<H', size_bytes)[0]
-
-                    # 3. Read Message Body
-                    msg_body = ser.read(msg_size)
-                    if len(msg_body) < msg_size: continue
-
-                    # 4. Read Footer (Checksum) - discard
+                    size = struct.unpack('<H', ser.read(2))[0]
+                    body = ser.read(size)
                     ser.read(2)
 
-                    # 5. Process Command 50011 (MDI)
-                    cmd = struct.unpack('<H', msg_body[0:2])[0]
+                    cmd = struct.unpack('<H', body[:2])[0]
+
                     if cmd == 50011:
-                        # Extract distance data
-                        # [0:2] = CMD
-                        # [2] = Plane Number (Optional, usually 1 byte)
-                        # [3:] = Distance Data
-                        raw_distances = msg_body[3:]
-
-                        process_raw_data(raw_distances)
-
+                        process_raw_data(body[3:])
                         scan_count += 1
+
                         if scan_count % 10 == 0:
-                            sys.stdout.write(f"\r[Recording] Scans Captured: {scan_count}")
+                            sys.stdout.write(f"\rScans: {scan_count}")
                             sys.stdout.flush()
 
     except KeyboardInterrupt:
-        if 'ser' in locals() and ser.is_open:
-            ser.close()
-        # On CTRL+C, we trigger the save
+        ser.close()
         save_statistical_pcd(beam_history, OUTPUT_FILENAME)
 
     except Exception as e:
-        print(f"\n❌ Error: {e}")
-        if 'ser' in locals() and ser.is_open:
-            ser.close()
+        print("❌ Error:", e)
 
 
 if __name__ == "__main__":
