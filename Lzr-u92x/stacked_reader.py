@@ -1,169 +1,149 @@
 import serial
-import time
-import numpy as np
-import datetime
-import os
 import struct
+import numpy as np
+import time
+import os
+import datetime
 
-# ==========================================
-# CONFIGURATION
-# ==========================================
-SERIAL_PORT = 'COM5'  # Update this to your COM port
-BAUD_RATE = 460800  # LZR-U921 Standard Baud
-SAVE_DIRECTORY = "./scans"
+# --- CONFIGURATION ---
+SERIAL_PORT = 'COM4'  # Change to COMx for Windows
+BAUD_RATE = 921600  # Default high-speed baud
+SYNC_HEADER = b'\xfc\xfd\xfe\xff'  # OxFFFE FDFC in little-endian
 
-# --- 3D STACKING SETTINGS ---
-X_INCREMENT_METERS = 0.015
-
-# --- SENSOR GEOMETRY ---
-FOV_START_DEG = -48.0
-FOV_END_DEG = 48.0
-MAX_POINTS = 274  #
-
-# LZR Sync Header: 0xFFFEFDFC
-LZR_SYNC = b'\xFC\xFD\xFE\xFF'
-
-all_points_buffer = []
-scan_counter = 0
+# Stacking Configuration
+# X_INCREMENT controls the "speed" of the stack.
+# 0.10 means 10cm of movement between every scan frame.
+X_INCREMENT = 0.10
 
 
-def save_combined_pcd(points_list, output_folder):
-    """Saves accumulated 3D points to a PCD file."""
-    if not points_list:
-        print("[WARNING] No points to save.")
+def save_to_pcd(points, filename="lzr_scan_stacked.pcd"):
+    """Saves a list of (x, y, z) points to a PCD file format."""
+    if not points:
+        print("No points to save.")
         return
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
 
+    # Generate a timestamped filename so we don't overwrite previous scans
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = os.path.join(output_folder, f"lzr_u921_stacked_{timestamp}.pcd")
+    filename = f"lzr_scan_{timestamp}.pcd"
 
-    num_points = len(points_list)
-    print(f"\n[SAVING] Writing {num_points} points to {filename}...")
+    print(f"Saving {len(points)} points to {filename}...")
 
+    header = (
+        "# .PCD v0.7 - Point Cloud Data\n"
+        "VERSION 0.7\n"
+        "FIELDS x y z\n"
+        "SIZE 4 4 4\n"
+        "TYPE F F F\n"
+        "COUNT 1 1 1\n"
+        f"WIDTH {len(points)}\n"
+        "HEIGHT 1\n"
+        "VIEWPOINT 0 0 0 1 0 0 0\n"
+        f"POINTS {len(points)}\n"
+        "DATA ascii\n"
+    )
+    with open(filename, 'w') as f:
+        f.write(header)
+        for p in points:
+            f.write(f"{p[0]:.4f} {p[1]:.4f} {p[2]:.4f}\n")
+    print("Save complete.")
+
+
+def parse_mdi(data_bytes):
+    """Converts raw distance values (mm) to Cartesian (sensor_x, sensor_y) coordinates."""
+    points_2d = []
+    num_values = len(data_bytes) // 2
+
+    # Angular resolution is ~0.3516°
+    # Starting angle is -48°
+    start_angle = -48.0
+    angular_res = 0.3516
+
+    for i in range(num_values):
+        # Each distance is encoded via 2 bytes (little-endian)
+        dist_mm = struct.unpack('<H', data_bytes[i * 2: i * 2 + 2])[0]
+
+        # Ignore noise / max range (filter out points < 5cm or > 20m)
+        if dist_mm < 50 or dist_mm > 20000:
+            continue
+
+        # Calculate angle for the current spot
+        angle_rad = np.radians(start_angle + (i * angular_res))
+
+        # Convert Polar (dist, angle) to Cartesian (sensor_x, sensor_y)
+        # matches your original code logic:
+        # x = dist * cos(angle)
+        # y = dist * sin(angle)
+        sensor_x = (dist_mm / 1000.0) * np.cos(angle_rad)
+        sensor_y = (dist_mm / 1000.0) * np.sin(angle_rad)
+
+        points_2d.append((sensor_x, sensor_y))
+
+    return points_2d
+
+
+def main():
     try:
-        with open(filename, 'w') as f:
-            f.write("# .PCD v.7\nVERSION .7\nFIELDS x y z\nSIZE 4 4 4\nTYPE F F F\nCOUNT 1 1 1\n")
-            f.write(f"WIDTH {num_points}\nHEIGHT 1\nVIEWPOINT 0 0 0 1 0 0 0\nPOINTS {num_points}\nDATA ascii\n")
-            for p in points_list:
-                f.write(f"{p[0]:.4f} {p[1]:.4f} {p[2]:.4f}\n")
-        print(f"[COMPLETE] File saved: {filename}")
-    except Exception as e:
-        print(f"[ERROR] Save failed: {e}")
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+        print(f"Connected to LZR-U921 on {SERIAL_PORT}")
+        print("Starting continuous capture... Press Ctrl+C to stop and save.")
 
+        all_captured_points = []
+        scan_counter = 0
 
-def verify_checksum(payload, received_chk):
-    """
-    Calculates the 16-bit sum of the payload.
-    Checks against both Little and Big Endian interpretations.
-    """
-    calc_sum = sum(payload) & 0xFFFF
-    # Checksum is valid if it matches the received value
-    return calc_sum == received_chk
-
-
-def process_lzr_packet(payload):
-    """
-    Parses distances using Big-Endian and 14-bit masking.
-    """
-    valid_points = []
-    try:
-        # Command word is Big-Endian
-        cmd = struct.unpack('>H', payload[:2])[0]
-        if cmd != 50011:
-            return []
-
-        # Distance block is 548 bytes at the end of the payload
-        mdi_size = MAX_POINTS * 2
-        raw_data = payload[-mdi_size:]
-        num_points = len(raw_data) // 2
-
-        # Correct resolution to fix 'curved wall'
-        step = (FOV_END_DEG - FOV_START_DEG) / (num_points - 1)
-
-        for i in range(num_points):
-            # Read 2-byte distance as Big-Endian
-            raw_val = struct.unpack('>H', raw_data[i * 2: i * 2 + 2])[0]
-
-            # Mask top 2 status bits to fix 'ghost points'
-            dist_mm = raw_val & 0x3FFF
-
-            if 50 < dist_mm < 10000:  # Ignore noise and max-range
-                angle_deg = FOV_START_DEG + (i * step)
-                angle_rad = np.radians(angle_deg)
-
-                # Cartesian conversion
-                y_sens = (dist_mm / 1000.0) * np.sin(angle_rad)
-                z_sens = (dist_mm / 1000.0) * np.cos(angle_rad)
-
-                valid_points.append({'y': y_sens, 'z': z_sens})
-        return valid_points
-    except:
-        return []
-
-
-def run_recorder():
-    global scan_counter
-    try:
-        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.05)
-        ser.reset_input_buffer()
-
-        print(f"🚀 LZR-U921 3D Recorder Started (Baud: {BAUD_RATE})")
-        print("Press Ctrl+C to stop and save.")
-
-        buffer = b""
         while True:
-            if ser.in_waiting:
-                buffer += ser.read(ser.in_waiting)
+            # 1. Look for SYNC
+            if ser.read(1) == b'\xfc':
+                if ser.read(3) == b'\xfd\xfe\xff':
+                    # 2. Read SIZE (2 bytes)
+                    size_bytes = ser.read(2)
+                    msg_size = struct.unpack('<H', size_bytes)[0]
 
-                sync_idx = buffer.find(LZR_SYNC)
-                if sync_idx >= 0:
-                    buffer = buffer[sync_idx:]
+                    # 3. Read Message (CMD + DATA)
+                    msg_body = ser.read(msg_size)
 
-                    if len(buffer) < 8:  # Sync(4) + Size(2) + Payload... + Checksum(2)
-                        continue
+                    # 4. Read Footer (CHK - 2 bytes)
+                    ser.read(2)
 
-                    # Size field is usually Little-Endian
-                    msg_size = struct.unpack('<H', buffer[4:6])[0]
-                    total_packet_len = 4 + 2 + msg_size + 2
+                    # CMD 50011 indicates Measured Distance Information
+                    cmd = struct.unpack('<H', msg_body[0:2])[0]
+                    if cmd == 50011:
+                        # Extract distance data (offset depends on enabled options)
+                        # Standard MDI starts after CMD (2 bytes)
+                        # and optional Plane Number (1 byte)
+                        raw_distances = msg_body[3:]
 
-                    if len(buffer) < total_packet_len:
-                        continue
+                        # Get the 2D points from the sensor
+                        scan_2d = parse_mdi(raw_distances)
 
-                    packet = buffer[:total_packet_len]
-                    buffer = buffer[total_packet_len:]
+                        # --- STACKING LOGIC ---
+                        # Calculate the 'Travel' position (World X)
+                        # This simulates the vehicle moving through the toll plaza
+                        travel_x = scan_counter * X_INCREMENT
 
-                    payload = packet[6: 6 + msg_size]
+                        for (sensor_x, sensor_y) in scan_2d:
+                            # Map to 3D World Coordinates:
+                            # World X = Travel Direction (Time)
+                            # World Y = Sensor X (Width)
+                            # World Z = Sensor Y (Height)
+                            all_captured_points.append((travel_x, sensor_x, sensor_y))
 
-                    # Try Checksum as Little-Endian
-                    chk_field_le = struct.unpack('<H', packet[6 + msg_size: 6 + msg_size + 2])[0]
-                    # Try Checksum as Big-Endian
-                    chk_field_be = struct.unpack('>H', packet[6 + msg_size: 6 + msg_size + 2])[0]
+                        scan_counter += 1
 
-                    if verify_checksum(payload, chk_field_le) or verify_checksum(payload, chk_field_be):
-                        points = process_lzr_packet(payload)
-                        if points:
-                            scan_counter += 1
-                            x_world = scan_counter * X_INCREMENT_METERS
-                            for pt in points:
-                                all_points_buffer.append((x_world, pt['y'], pt['z']))
-
-                            if scan_counter % 60 == 0:
-                                print(f"Processing... {scan_counter} scans captured.")
-                    else:
-                        # Optional: print(f"Checksum Fail: Sum {sum(payload)&0xFFFF}")
-                        pass
-                else:
-                    if len(buffer) > 4096:
-                        buffer = buffer[-1024:]
+                        # Print status every 20 scans so you know it's working
+                        if scan_counter % 20 == 0:
+                            print(f"Captured {scan_counter} frames... Total points: {len(all_captured_points)}")
 
     except KeyboardInterrupt:
-        print("\nStopping and saving...")
+        print("\nStop signal received.")
+    except Exception as e:
+        print(f"Error: {e}")
     finally:
         if 'ser' in locals() and ser.is_open:
             ser.close()
-        save_combined_pcd(all_points_buffer, SAVE_DIRECTORY)
+        # Save whatever we captured
+        save_to_pcd(all_captured_points, "lzr_stacked_output.pcd")
+        print("File saved successfully.")
 
 
 if __name__ == "__main__":
-    run_recorder()
+    main()

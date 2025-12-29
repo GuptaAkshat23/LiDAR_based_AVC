@@ -4,7 +4,7 @@ import numpy as np
 import time
 
 # --- CONFIGURATION ---
-SERIAL_PORT = 'COM5'  # Change to COMx for Windows
+SERIAL_PORT = 'COM4'  # Change to COMx for Windows
 BAUD_RATE = 921600  # Default high-speed baud [cite: 80, 740]
 SYNC_HEADER = b'\xfc\xfd\xfe\xff'  # OxFFFE FDFC in little-endian
 
