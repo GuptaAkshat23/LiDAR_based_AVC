@@ -7,9 +7,9 @@ import time
 # =====================================================
 # CONFIGURATION
 # =====================================================
-SERIAL_PORT = 'COM8'
+SERIAL_PORT = 'COM4'
 BAUD_RATE = 921600
-OUTPUT_FILENAME = "u921_stacked_scans_speed_corrected.pcd"
+OUTPUT_FILENAME = "u921_stacked_scans.pcd"
 
 START_ANGLE = -48.0
 ANGULAR_RES = 0.3516
@@ -17,11 +17,8 @@ ANGULAR_RES = 0.3516
 MIN_RANGE_M = 0.10
 MAX_RANGE_M = 3.00
 
-# ---------------- SPEED SETTINGS ----------------
-VEHICLE_SPEED_KMPH = 2
-VEHICLE_SPEED_MPS = VEHICLE_SPEED_KMPH / 3.6  # 8.33 m/s
-
-MAX_SCANS = 200  # None to run until CTRL+C
+Z_INCREMENT = 0.05   # 5 cm per scan
+MAX_SCANS = 200     # set None to run until CTRL+C
 
 SYNC_HEADER = b'\xfc\xfd\xfe\xff'
 
@@ -30,10 +27,9 @@ SYNC_HEADER = b'\xfc\xfd\xfe\xff'
 # =====================================================
 stacked_points = []
 scan_index = 0
-start_time = None   # <<< IMPORTANT
 
 # =====================================================
-# PROCESS ONE SCAN
+# PROCESS ONE SCAN (NO HISTORY)
 # =====================================================
 def process_single_scan(data_bytes, z_value):
     points = []
@@ -68,7 +64,7 @@ def save_stacked_pcd(points, filename):
         return
 
     header = (
-        "# .PCD v0.7 - LZR U921 SPEED-CORRECTED STACKED SCANS\n"
+        "# .PCD v0.7 - LZR U921 STACKED SCANS\n"
         "VERSION 0.7\n"
         "FIELDS x y z\n"
         "SIZE 4 4 4\n"
@@ -86,23 +82,20 @@ def save_stacked_pcd(points, filename):
         for p in points:
             f.write(f"{p[0]:.4f} {p[1]:.4f} {p[2]:.4f}\n")
 
-    print(f"\n✅ SPEED-CORRECTED STACKED PCD SAVED → {filename}")
-    print(f"📊 Total points: {len(points)}")
+    print(f"\n✅ STACKED PCD SAVED → {filename}")
+    print(f"📊 Total stacked points: {len(points)}")
 
 # =====================================================
 # MAIN LOOP
 # =====================================================
 def main():
-    global scan_index, start_time
+    global scan_index
 
     try:
         ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
         print("🚀 U921 Connected")
-        print("🚗 Assuming vehicle speed: 30 km/h (8.33 m/s)")
-        print("📦 Speed-corrected stacking started")
+        print("📦 Stacking scans...")
         print("⌨️  CTRL+C to stop")
-
-        start_time = time.time()
 
         while True:
             if ser.read(1) == b'\xfc' and ser.read(3) == b'\xfd\xfe\xff':
@@ -114,18 +107,14 @@ def main():
                 cmd = struct.unpack('<H', body[:2])[0]
 
                 if cmd == 50011:
-                    current_time = time.time()
-                    elapsed_time = current_time - start_time
-
-                    # 🚗 REAL DISTANCE = speed × time
-                    z_value = elapsed_time * VEHICLE_SPEED_MPS
-
+                    z_value = scan_index * Z_INCREMENT
                     scan_points = process_single_scan(body[3:], z_value)
-                    stacked_points.extend(scan_points)
 
+                    stacked_points.extend(scan_points)
                     scan_index += 1
+
                     sys.stdout.write(
-                        f"\rScans: {scan_index} | Z={z_value:.2f} m | Points: {len(stacked_points)}"
+                        f"\rScans stacked: {scan_index} | Points: {len(stacked_points)}"
                     )
                     sys.stdout.flush()
 
@@ -133,7 +122,7 @@ def main():
                         break
 
     except KeyboardInterrupt:
-        print("\n⏹️ Capture stopped by user")
+        print("\n⏹️ Stopping capture...")
 
     finally:
         if 'ser' in locals():

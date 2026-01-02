@@ -7,7 +7,7 @@ import os
 import sys
 
 # --- CONFIGURATION ---
-SERIAL_PORT = 'COM8'
+SERIAL_PORT = 'COM4'
 BAUD_RATE = 921600
 OUTPUT_FILENAME = "lzr_zero_plane_clean.pcd"
 
@@ -24,7 +24,9 @@ MAX_NEIGHBOR_JUMP = 0.15  # 15 cm allowed jump between beams
 beam_history = {}
 
 
-
+# ----------------------------------------------------
+# ROBUST STATISTICS (MAD FILTER)
+# ----------------------------------------------------
 def robust_median(distances):
     """
     Removes outliers using Median Absolute Deviation (MAD)
