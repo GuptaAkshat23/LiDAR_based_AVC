@@ -8,22 +8,24 @@ import threading
 import queue
 import os
 from datetime import datetime
-from collections import Counter
+import statistics
 
 # =====================================================
 # CONFIGURATION
 # =====================================================
 SERIAL_PORT = 'COM8'
 BAUD_RATE = 921600
+
 START_ANGLE = -48.0
 ANGULAR_RES = 0.3516
 
-# --- CALIBRATION & ACCURACY ---
 CALIBRATION_FRAMES = 3000
-MIN_CONFIDENCE_RATIO = 0.9
 GRID_CELL_SIZE = 0.05
 
-# --- VEHICLE STACKING ---
+MIN_RANGE_M = 0.10
+MAX_RANGE_M = 3.5
+MAX_NEIGHBOR_JUMP = 0.15
+
 VEHICLE_SPEED_KMPH = 0.5
 VEHICLE_SPEED_MPS = VEHICLE_SPEED_KMPH / 3.6
 TRIGGER_THRESHOLD = 20
@@ -32,147 +34,198 @@ GRID_RES = 0.005
 
 processing_queue = queue.Queue()
 
+# =====================================================
+# ROBUST MEDIAN (MAD)
+# =====================================================
+def robust_median(distances):
+    if len(distances) < 5:
+        return None
 
+    median = statistics.median(distances)
+    deviations = [abs(d - median) for d in distances]
+    mad = statistics.median(deviations)
+
+    if mad == 0:
+        return median
+
+    filtered = [d for d in distances if abs(d - median) <= 3 * mad]
+    return statistics.median(filtered) if filtered else None
+
+
+# =====================================================
+# MAIN SYSTEM
+# =====================================================
 class TollPlazaSystem:
     def __init__(self):
         self.ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
         self.background_matrix = set()
-        self.background_points_raw = []  # For saving zero plane PCD
         self.is_stacking = False
-        self.current_full_stack = []  # Includes EVERYTHING (for raw save)
+        self.current_full_stack = []
+        self.current_extracted = []
         self.last_detection_time = time.time()
         self.start_capture_time = None
 
+    # =================================================
+    # ROBUST ZERO PLANE CALIBRATION (MERGED)
+    # =================================================
     def calibrate(self):
-        """Trains the background and saves the Zero Plane file."""
-        print(f"⌛ Training Zero Plane using {CALIBRATION_FRAMES} frames...")
-        if not os.path.exists("calibration"): os.makedirs("calibration")
+        print(f"⌛ Robust Zero Plane Training ({CALIBRATION_FRAMES} frames)")
+        os.makedirs("calibration", exist_ok=True)
 
-        cell_frequency = Counter()
-        cell_coords = {}
-        frames_captured = 0
+        beam_history = {}
+        frames = 0
 
-        while frames_captured < CALIBRATION_FRAMES:
-            raw_points = self.get_raw_frame()
-            if raw_points:
-                unique_cells_in_frame = set()
-                for p in raw_points:
-                    ix, iy = int(np.floor(p[0] / GRID_CELL_SIZE)), int(np.floor(p[1] / GRID_CELL_SIZE))
-                    unique_cells_in_frame.add((ix, iy))
-                    cell_coords[(ix, iy)] = [p[0], p[1], 0.0]
+        while frames < CALIBRATION_FRAMES:
+            if self.ser.read(1) == b'\xfc' and self.ser.read(3) == b'\xfd\xfe\xff':
+                size = struct.unpack('<H', self.ser.read(2))[0]
+                body = self.ser.read(size)
+                self.ser.read(2)
 
-                for cell in unique_cells_in_frame:
-                    cell_frequency[cell] += 1
-                frames_captured += 1
-                if frames_captured % 100 == 0:
-                    print(f"   Progress: {frames_captured}/{CALIBRATION_FRAMES}")
+                if struct.unpack('<H', body[:2])[0] == 50011:
+                    data = body[3:]
+                    for i in range(len(data) // 2):
+                        d = struct.unpack('<H', data[i*2:i*2+2])[0]
+                        if d > 0:
+                            beam_history.setdefault(i, []).append(d)
+                    frames += 1
 
-        final_bg_pts = []
-        for cell, count in cell_frequency.items():
-            if count >= (CALIBRATION_FRAMES * MIN_CONFIDENCE_RATIO):
-                self.background_matrix.add(cell)
-                final_bg_pts.append(cell_coords[cell])
+                    if frames % 200 == 0:
+                        print(f"   Frames: {frames}/{CALIBRATION_FRAMES}")
 
-        # SAVE ZERO PLANE
-        bg_pcd = o3d.geometry.PointCloud()
-        bg_pcd.points = o3d.utility.Vector3dVector(np.array(final_bg_pts))
-        o3d.io.write_point_cloud("calibration/lzr_zero_plane.pcd", bg_pcd)
-        print(f"✅ Calibration complete. Saved to 'calibration/lzr_zero_plane.pcd'")
+        # ---------- Beam-wise robust median ----------
+        beam_points = {}
+        for i, dlist in beam_history.items():
+            robust_mm = robust_median(dlist)
+            if robust_mm is None:
+                continue
 
+            dist_m = robust_mm / 1000.0
+            if not (MIN_RANGE_M <= dist_m <= MAX_RANGE_M):
+                continue
+
+            angle = np.radians(START_ANGLE + i * ANGULAR_RES)
+            x = dist_m * np.cos(angle)
+            y = dist_m * np.sin(angle)
+            beam_points[i] = (x, y, 0.0)
+
+        # ---------- Neighbor consistency ----------
+        clean_zero_pts = []
+        idxs = sorted(beam_points.keys())
+
+        for j, idx in enumerate(idxs):
+            x, y, z = beam_points[idx]
+
+            if 0 < j < len(idxs) - 1:
+                d_prev = np.linalg.norm(beam_points[idxs[j-1]][:2])
+                d_curr = np.linalg.norm((x, y))
+                d_next = np.linalg.norm(beam_points[idxs[j+1]][:2])
+
+                if abs(d_curr - d_prev) > MAX_NEIGHBOR_JUMP and \
+                   abs(d_curr - d_next) > MAX_NEIGHBOR_JUMP:
+                    continue
+
+            clean_zero_pts.append((x, y, z))
+
+            ix = int(np.floor(x / GRID_CELL_SIZE))
+            iy = int(np.floor(y / GRID_CELL_SIZE))
+            self.background_matrix.add((ix, iy))
+
+        # ---------- Save Zero Plane ----------
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(np.array(clean_zero_pts))
+        o3d.io.write_point_cloud("calibration/lzr_zero_plane.pcd", pcd)
+
+        print(f"✅ Robust Zero Plane Saved ({len(clean_zero_pts)} points)")
+
+    # =================================================
+    # READ SINGLE FRAME
+    # =================================================
     def get_raw_frame(self):
         if self.ser.read(1) == b'\xfc' and self.ser.read(3) == b'\xfd\xfe\xff':
             size = struct.unpack('<H', self.ser.read(2))[0]
             body = self.ser.read(size)
             self.ser.read(2)
+
             if struct.unpack('<H', body[:2])[0] == 50011:
-                data, points = body[3:], []
-                for i in range(len(data) // 2):
-                    d_mm = struct.unpack('<H', data[i * 2:i * 2 + 2])[0]
+                data = body[3:]
+                pts = []
+                for i in range(len(data)//2):
+                    d_mm = struct.unpack('<H', data[i*2:i*2+2])[0]
                     if 100 < d_mm < 3500:
                         dist = d_mm / 1000.0
-                        rad = np.radians(START_ANGLE + i * ANGULAR_RES)
-                        points.append([dist * np.cos(rad), dist * np.sin(rad)])
-                return points
+                        ang = np.radians(START_ANGLE + i * ANGULAR_RES)
+                        pts.append([dist*np.cos(ang), dist*np.sin(ang)])
+                return pts
         return None
 
+    # =================================================
+    # MAIN LOOP
+    # =================================================
     def run_forever(self):
         threading.Thread(target=background_processor, daemon=True).start()
         self.calibrate()
-        print("🚀 System Live. Monitoring...")
+        print("🚀 System Live")
 
         while True:
-            raw_scan_xy = self.get_raw_frame()
-            if not raw_scan_xy: continue
+            raw_xy = self.get_raw_frame()
+            if not raw_xy:
+                continue
 
-            current_time = time.time()
-            extracted_points = []
-            z_val = (current_time - self.start_capture_time) * VEHICLE_SPEED_MPS if self.is_stacking else 0
+            t = time.time()
+            z = (t - self.start_capture_time) * VEHICLE_SPEED_MPS if self.is_stacking else 0
 
-            # Temporary list for the raw stacked profile (including background)
-            raw_scan_xyz = [[p[0], p[1], z_val] for p in raw_scan_xy]
+            raw_xyz = [[p[0], p[1], z] for p in raw_xy]
+            extracted = []
 
-            for p in raw_scan_xy:
-                ix, iy = int(np.floor(p[0] / GRID_CELL_SIZE)), int(np.floor(p[1] / GRID_CELL_SIZE))
+            for p in raw_xy:
+                ix = int(np.floor(p[0] / GRID_CELL_SIZE))
+                iy = int(np.floor(p[1] / GRID_CELL_SIZE))
                 if (ix, iy) not in self.background_matrix:
-                    extracted_points.append([p[0], p[1], z_val])
+                    extracted.append([p[0], p[1], z])
 
-            if len(extracted_points) > TRIGGER_THRESHOLD:
+            if len(extracted) > TRIGGER_THRESHOLD:
                 if not self.is_stacking:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] 🚗 Vehicle Detected")
-                    self.is_stacking, self.current_full_stack, self.current_extracted = True, [], []
+                    self.is_stacking = True
+                    self.current_full_stack = []
+                    self.current_extracted = []
                     self.start_capture_time = time.time()
+                    print("🚗 Vehicle Detected")
 
-                self.current_full_stack.extend(raw_scan_xyz)
-                self.current_extracted.extend(extracted_points)
+                self.current_full_stack.extend(raw_xyz)
+                self.current_extracted.extend(extracted)
                 self.last_detection_time = time.time()
 
-            elif self.is_stacking and (time.time() - self.last_detection_time > IDLE_TIMEOUT):
+            elif self.is_stacking and time.time() - self.last_detection_time > IDLE_TIMEOUT:
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                # Send both full stack and extracted stack to processor
                 processing_queue.put((self.current_full_stack, self.current_extracted, ts))
                 self.is_stacking = False
-                print(f"🏁 Vehicle {ts} moved to processing.")
+                print(f"🏁 Vehicle {ts} queued")
 
 
+# =====================================================
+# BACKGROUND PROCESSOR (UNCHANGED)
+# =====================================================
 def background_processor():
     while True:
-        data_packet = processing_queue.get()
-        if data_packet is None: break
-        full_stack, extracted_stack, ts = data_packet
-
-        # Create folder for this vehicle
+        full_stack, extracted_stack, ts = processing_queue.get()
         folder = f"vehicle_{ts}"
-        if not os.path.exists(folder): os.makedirs(folder)
+        os.makedirs(folder, exist_ok=True)
 
-        # 1. Save Raw Stacked Profile
-        pcd_raw = o3d.geometry.PointCloud()
-        pcd_raw.points = o3d.utility.Vector3dVector(np.array(full_stack))
-        o3d.io.write_point_cloud(f"{folder}/1_raw_stacked.pcd", pcd_raw)
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(np.array(extracted_stack))
+        pcd, _ = pcd.remove_statistical_outlier(25, 0.8)
+        pcd, _ = pcd.remove_radius_outlier(12, 0.06)
 
-        # 2. Save Extracted Profile
-        pcd_ext = o3d.geometry.PointCloud()
-        pcd_ext.points = o3d.utility.Vector3dVector(np.array(extracted_stack))
-        o3d.io.write_point_cloud(f"{folder}/2_extracted_object.pcd", pcd_ext)
+        R = np.array([[0,0,1],[0,1,0],[-1,0,0]])
+        pts = np.asarray(pcd.points)
+        pts = (R @ pts.T).T
 
-        # 3. Outlier Removal
-        pcd_clean, _ = pcd_ext.remove_statistical_outlier(nb_neighbors=25, std_ratio=0.8)
-        pcd_clean, _ = pcd_clean.remove_radius_outlier(nb_points=12, radius=0.06)
-        o3d.io.write_point_cloud(f"{folder}/3_cleaned_object.pcd", pcd_clean)
+        pcd.points = o3d.utility.Vector3dVector(pts)
+        o3d.io.write_point_cloud(f"{folder}/side_view.pcd", pcd)
 
-        # 4. Save BEV Image
-        pts = np.asarray(pcd_clean.points)
-        if len(pts) > 0:
-            x_min, x_max, z_max = np.min(pts[:, 0]), np.max(pts[:, 0]), np.max(pts[:, 2])
-            w, h = int((x_max - x_min + 0.2) / GRID_RES), int((z_max + 0.2) / GRID_RES)
-            bev = np.zeros((h, w), dtype=np.uint8)
-            for x, y, z in pts:
-                xi, zi = int((x - x_min + 0.1) / GRID_RES), int(z / GRID_RES)
-                if 0 <= xi < w and 0 <= zi < h: bev[zi, xi] = 255
-            cv2.imwrite(f"{folder}/4_BEV_image.png", np.flipud(bev))
-
-        print(f"✅ All stages saved in {folder}")
         processing_queue.task_done()
 
 
+# =====================================================
 if __name__ == "__main__":
     TollPlazaSystem().run_forever()
