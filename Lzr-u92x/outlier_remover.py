@@ -21,7 +21,7 @@ def remove_outliers():
     pcd = o3d.io.read_point_cloud(file_path)
 
     # Optional: Downsample to speed up processing if the cloud is very dense
-    # pcd = pcd.voxel_down_sample(voxel_size=0.02)
+    #pcd = pcd.voxel_down_sample(voxel_size=0.02)
 
     # 3. Statistical Outlier Removal (SOR)
     # This removes points that are further away from their neighbors compared to the average.
