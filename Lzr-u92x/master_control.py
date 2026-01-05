@@ -13,7 +13,7 @@ import statistics
 # =====================================================
 # CONFIGURATION
 # =====================================================
-SERIAL_PORT = 'COM8'
+SERIAL_PORT = 'COM5'
 BAUD_RATE = 921600
 
 START_ANGLE = -48.0
