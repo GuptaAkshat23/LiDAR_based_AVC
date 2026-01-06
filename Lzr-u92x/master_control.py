@@ -13,13 +13,13 @@ import statistics
 # =====================================================
 # CONFIGURATION
 # =====================================================
-SERIAL_PORT = 'COM5'
+SERIAL_PORT = 'COM6'
 BAUD_RATE = 921600
 
 START_ANGLE = -48.0
 ANGULAR_RES = 0.3516
 
-CALIBRATION_FRAMES = 3000
+CALIBRATION_FRAMES = 4500
 GRID_CELL_SIZE = 0.05
 
 MIN_RANGE_M = 0.10
