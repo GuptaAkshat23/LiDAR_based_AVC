@@ -193,8 +193,15 @@ class TollPlazaSystem:
             angle = np.radians(START_ANGLE + idx * ANGULAR_RES)
             x, y = dist_m * np.cos(angle), dist_m * np.sin(angle)
             clean_zero_pts.append((x, y, 0.0))
+
             ix, iy = int(np.floor(x / GRID_CELL_SIZE)), int(np.floor(y / GRID_CELL_SIZE))
-            self.background_matrix.add((ix, iy))
+
+            # [FIX APPLIED HERE] Dilation Strategy
+            # Instead of just adding (ix, iy), we add the neighbors too.
+            # This handles the jitter/noise at the edges of the grid cells.
+            for dx in [-1, 0, 1]:
+                for dy in [-1, 0, 1]:
+                    self.background_matrix.add((ix + dx, iy + dy))
 
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(np.array(clean_zero_pts))
