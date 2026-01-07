@@ -31,7 +31,7 @@ VEHICLE_SPEED_MPS = VEHICLE_SPEED_KMPH / 3.6
 TRIGGER_THRESHOLD = 20
 IDLE_TIMEOUT = 0.8
 
-# Image Generation Parameters (from your Image Code)
+# Image Generation Parameters
 X_IMG_RANGE = (-1, 1)
 Y_IMG_RANGE = (-1, 1)
 GRID_RES = 0.005  # 5mm per pixel
@@ -60,7 +60,8 @@ def robust_median(distances):
 # =====================================================
 class TollPlazaSystem:
     def __init__(self):
-        self.ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
+        # Increased timeout slightly to 0.2 to reduce partial reads on slow cycles
+        self.ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.2)
         self.background_matrix = set()
         self.is_stacking = False
         self.current_full_stack = []
@@ -73,21 +74,41 @@ class TollPlazaSystem:
         os.makedirs("calibration", exist_ok=True)
         beam_history = {}
         frames = 0
+
         while frames < CALIBRATION_FRAMES:
+            # 1. Sync Header
             if self.ser.read(1) == b'\xfc' and self.ser.read(3) == b'\xfd\xfe\xff':
-                size = struct.unpack('<H', self.ser.read(2))[0]
+                # 2. Read Size
+                size_data = self.ser.read(2)
+                if len(size_data) < 2: continue
+
+                size = struct.unpack('<H', size_data)[0]
+
+                # 3. Read Body (Safety Fix Here)
                 body = self.ser.read(size)
+                if len(body) != size:
+                    # If we read fewer bytes than expected, skip this packet
+                    continue
+
+                # 4. Skip Checksum
                 self.ser.read(2)
-                if struct.unpack('<H', body[:2])[0] == 50011:
+
+                # 5. Decode Body (Safety Fix Here)
+                # Check if body has at least 2 bytes before unpacking header
+                if len(body) >= 2 and struct.unpack('<H', body[:2])[0] == 50011:
                     data = body[3:]
                     for i in range(len(data) // 2):
-                        d = struct.unpack('<H', data[i * 2:i * 2 + 2])[0]
-                        if d > 0:
-                            beam_history.setdefault(i, []).append(d)
+                        # Ensure index is within bounds
+                        if i * 2 + 2 <= len(data):
+                            d = struct.unpack('<H', data[i * 2:i * 2 + 2])[0]
+                            if d > 0:
+                                beam_history.setdefault(i, []).append(d)
+
                     frames += 1
                     if frames % 200 == 0:
                         print(f"    Frames: {frames}/{CALIBRATION_FRAMES}")
 
+        # Compute Robust Background
         clean_zero_pts = []
         idxs = sorted(beam_history.keys())
         for j, idx in enumerate(idxs):
@@ -107,19 +128,32 @@ class TollPlazaSystem:
         print(f"✅ Robust Zero Plane Saved ({len(clean_zero_pts)} points)")
 
     def get_raw_frame(self):
+        # 1. Sync Header
         if self.ser.read(1) == b'\xfc' and self.ser.read(3) == b'\xfd\xfe\xff':
-            size = struct.unpack('<H', self.ser.read(2))[0]
+            # 2. Read Size
+            size_data = self.ser.read(2)
+            if len(size_data) < 2: return None
+
+            size = struct.unpack('<H', size_data)[0]
+
+            # 3. Read Body (Safety Fix)
             body = self.ser.read(size)
+            if len(body) != size: return None
+
+            # 4. Skip Checksum
             self.ser.read(2)
-            if struct.unpack('<H', body[:2])[0] == 50011:
+
+            # 5. Decode Body (Safety Fix)
+            if len(body) >= 2 and struct.unpack('<H', body[:2])[0] == 50011:
                 data = body[3:]
                 pts = []
                 for i in range(len(data) // 2):
-                    d_mm = struct.unpack('<H', data[i * 2:i * 2 + 2])[0]
-                    if 100 < d_mm < 3500:
-                        dist = d_mm / 1000.0
-                        ang = np.radians(START_ANGLE + i * ANGULAR_RES)
-                        pts.append([dist * np.cos(ang), dist * np.sin(ang)])
+                    if i * 2 + 2 <= len(data):
+                        d_mm = struct.unpack('<H', data[i * 2:i * 2 + 2])[0]
+                        if 100 < d_mm < 3500:
+                            dist = d_mm / 1000.0
+                            ang = np.radians(START_ANGLE + i * ANGULAR_RES)
+                            pts.append([dist * np.cos(ang), dist * np.sin(ang)])
                 return pts
         return None
 
@@ -130,10 +164,12 @@ class TollPlazaSystem:
         while True:
             raw_xy = self.get_raw_frame()
             if not raw_xy: continue
+
             t = time.time()
             z = (t - self.start_capture_time) * VEHICLE_SPEED_MPS if self.is_stacking else 0
             raw_xyz = [[p[0], p[1], z] for p in raw_xy]
             extracted = []
+
             for p in raw_xy:
                 ix, iy = int(np.floor(p[0] / GRID_CELL_SIZE)), int(np.floor(p[1] / GRID_CELL_SIZE))
                 if (ix, iy) not in self.background_matrix:
@@ -159,57 +195,72 @@ class TollPlazaSystem:
 # =====================================================
 def background_processor():
     while True:
-        extracted_stack, ts = processing_queue.get()
-        folder = f"vehicle_{ts}"
-        os.makedirs(folder, exist_ok=True)
+        try:
+            extracted_stack, ts = processing_queue.get()
+            folder = f"vehicle_{ts}"
+            os.makedirs(folder, exist_ok=True)
 
-        # 1. Cleaning
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(np.array(extracted_stack))
-        pcd, _ = pcd.remove_statistical_outlier(25, 0.8)
-        pcd, _ = pcd.remove_radius_outlier(12, 0.06)
+            # 1. Cleaning
+            if not extracted_stack:
+                processing_queue.task_done()
+                continue
 
-        # 2. Side View Transformation (Rotates for profile view)
-        R = np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]])
-        pts_side = (R @ np.asarray(pcd.points).T).T
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(np.array(extracted_stack))
 
-        pcd_side = o3d.geometry.PointCloud()
-        pcd_side.points = o3d.utility.Vector3dVector(pts_side)
-        o3d.io.write_point_cloud(f"{folder}/side_view.pcd", pcd_side)
+            # Check if point cloud is empty before processing
+            if len(pcd.points) < 10:
+                print(f"⚠️ Skipped {ts}: Not enough points.")
+                processing_queue.task_done()
+                continue
 
-        # 3. Side View Image Generation (Using logic from your Image Code)
-        if len(pts_side) > 0:
-            # ROI Filter on the transformed side points
-            mask = (
-                    (pts_side[:, 0] >= X_IMG_RANGE[0]) & (pts_side[:, 0] <= X_IMG_RANGE[1]) &
-                    (pts_side[:, 1] >= Y_IMG_RANGE[0]) & (pts_side[:, 1] <= Y_IMG_RANGE[1])
-            )
-            img_points = pts_side[mask]
+            pcd, _ = pcd.remove_statistical_outlier(25, 0.8)
+            pcd, _ = pcd.remove_radius_outlier(12, 0.06)
 
-            if len(img_points) > 0:
-                x_bins = int((X_IMG_RANGE[1] - X_IMG_RANGE[0]) / GRID_RES)
-                y_bins = int((Y_IMG_RANGE[1] - Y_IMG_RANGE[0]) / GRID_RES)
-                bev = np.zeros((y_bins, x_bins), dtype=np.float32)
+            # 2. Side View Transformation (Rotates for profile view)
+            R = np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]])
+            if len(pcd.points) > 0:
+                pts_side = (R @ np.asarray(pcd.points).T).T
 
-                for x, y, z in img_points:
-                    xi = int((x - X_IMG_RANGE[0]) / GRID_RES)
-                    yi = int((y - Y_IMG_RANGE[0]) / GRID_RES)
+                pcd_side = o3d.geometry.PointCloud()
+                pcd_side.points = o3d.utility.Vector3dVector(pts_side)
+                o3d.io.write_point_cloud(f"{folder}/side_view.pcd", pcd_side)
 
-                    if 0 <= xi < x_bins and 0 <= yi < y_bins:
-                        dist = np.sqrt(x ** 2 + y ** 2)
-                        intensity = 1.0 - min(dist / MAX_DIST_INTENSITY, 1.0)
-                        if intensity > bev[yi, xi]:
-                            bev[yi, xi] = intensity
+                # 3. Side View Image Generation
+                # ROI Filter on the transformed side points
+                mask = (
+                        (pts_side[:, 0] >= X_IMG_RANGE[0]) & (pts_side[:, 0] <= X_IMG_RANGE[1]) &
+                        (pts_side[:, 1] >= Y_IMG_RANGE[0]) & (pts_side[:, 1] <= Y_IMG_RANGE[1])
+                )
+                img_points = pts_side[mask]
 
-                # Final Image Processing
-                bev_img = (bev * 255).astype(np.uint8)
-                bev_img = np.flipud(bev_img)
-                bev_img = cv2.GaussianBlur(bev_img, (3, 3), 0)
+                if len(img_points) > 0:
+                    x_bins = int((X_IMG_RANGE[1] - X_IMG_RANGE[0]) / GRID_RES)
+                    y_bins = int((Y_IMG_RANGE[1] - Y_IMG_RANGE[0]) / GRID_RES)
+                    bev = np.zeros((y_bins, x_bins), dtype=np.float32)
 
-                cv2.imwrite(f"{folder}/side_view_image.png", bev_img)
+                    for x, y, z in img_points:
+                        xi = int((x - X_IMG_RANGE[0]) / GRID_RES)
+                        yi = int((y - Y_IMG_RANGE[0]) / GRID_RES)
 
-        print(f"✅ Vehicle {ts} Processed: side_view.pcd and side_view_image.png saved.")
-        processing_queue.task_done()
+                        if 0 <= xi < x_bins and 0 <= yi < y_bins:
+                            dist = np.sqrt(x ** 2 + y ** 2)
+                            intensity = 1.0 - min(dist / MAX_DIST_INTENSITY, 1.0)
+                            if intensity > bev[yi, xi]:
+                                bev[yi, xi] = intensity
+
+                    # Final Image Processing
+                    bev_img = (bev * 255).astype(np.uint8)
+                    bev_img = np.flipud(bev_img)
+                    bev_img = cv2.GaussianBlur(bev_img, (3, 3), 0)
+
+                    cv2.imwrite(f"{folder}/side_view_image.png", bev_img)
+
+            print(f"✅ Vehicle {ts} Processed: side_view.pcd and side_view_image.png saved.")
+        except Exception as e:
+            print(f"❌ Error in background processor: {e}")
+        finally:
+            processing_queue.task_done()
 
 
 if __name__ == "__main__":

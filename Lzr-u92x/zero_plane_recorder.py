@@ -7,7 +7,7 @@ import os
 import sys
 
 # --- CONFIGURATION ---
-SERIAL_PORT = 'COM6'
+SERIAL_PORT = 'COM8'
 BAUD_RATE = 921600
 OUTPUT_FILENAME = "lzr_zero_plane_clean.pcd"
 
