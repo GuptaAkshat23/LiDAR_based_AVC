@@ -6,7 +6,7 @@ import sys
 # =====================================================
 # CONFIGURATION
 # =====================================================
-SERIAL_PORT = '/dev/ttyUSB0'  # Ensure this matches your setup
+SERIAL_PORT = 'COM8'  # Ensure this matches your setup
 BAUD_RATE = 921600  # Matching your LZR-u921 config
 
 

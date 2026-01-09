@@ -13,7 +13,7 @@ import statistics
 # =====================================================
 # CONFIGURATION
 # =====================================================
-SERIAL_PORT = '/dev/ttyUSB0'  # Change to '/dev/ttyUSB0' or similar for RPi if needed
+SERIAL_PORT = 'COM8'  # Change to '/dev/ttyUSB0' or similar for RPi if needed
 BAUD_RATE = 921600
 
 START_ANGLE = -48.0

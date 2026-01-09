@@ -15,13 +15,15 @@ import sys
 # CONFIGURATION
 # =====================================================
 # Hardware
-SERIAL_PORT = 'COM8'  # Adjust for your Pi (e.g., /dev/ttyUSB0)
+SERIAL_PORT = 'COM9'  # Adjust for your Pi
 BAUD_RATE = 921600
 
 # Sensor Geometry
 START_ANGLE = -48.0
 ANGULAR_RES = 0.3516
-MIN_RANGE_M = 0.10
+
+# [FIX 1] Increased Minimum Range to ignore dust on lens
+MIN_RANGE_M = 0.50
 MAX_RANGE_M = 4.0  # Extended slightly for road width
 
 # Calibration
@@ -30,25 +32,25 @@ GRID_CELL_SIZE = 0.05
 MAX_NEIGHBOR_JUMP = 0.15
 
 # Physics (Speed)
-# Updated to 25 km/h for road testing to minimize Z-axis compression
+# [FIX 2] Updated to 25 km/h to match road conditions
 VEHICLE_SPEED_KMPH = 25.0
 VEHICLE_SPEED_MPS = VEHICLE_SPEED_KMPH / 3.6
 
 # Detection Logic
-# [FIX 1] Persistence: Vehicle must be seen for N frames to confirm it's real
-REQUIRED_PERSISTENCE = 3
-TRIGGER_THRESHOLD = 15  # Keep sensitive, but rely on Persistence to filter noise
-IDLE_TIMEOUT = 0.5  # Reduced to 0.5s for faster cut-off on roads
+# [FIX 3] Stricter thresholds to stop ghost detections
+TRIGGER_THRESHOLD = 40  # Ignores small noise clusters
+REQUIRED_PERSISTENCE = 5  # Object must be seen in 5 frames to confirm
+IDLE_TIMEOUT = 0.5  # Faster cutoff for road traffic
 
-# Image Generation
+# Image Generation Parameters
 X_IMG_RANGE = (-1, 1)
 Y_IMG_RANGE = (-1, 1)
 GRID_RES = 0.005  # 5mm per pixel
 MAX_DIST_INTENSITY = 50.0
 
-# Queues
-# frame_queue: Raw data from Sensor -> Main Loop
-# processing_queue: Extracted Object -> Image Generator
+# Global Queues
+# frame_queue: Raw data from Serial Thread -> Main Loop
+# processing_queue: Extracted Object -> Image Generator Thread
 frame_queue = queue.Queue()
 processing_queue = queue.Queue()
 
@@ -88,6 +90,7 @@ def background_processor():
 
             # 1. Point Cloud Cleaning
             pcd = o3d.geometry.PointCloud()
+            # Force float64 for RPi stability
             pcd.points = o3d.utility.Vector3dVector(np.array(extracted_stack, dtype=np.float64))
 
             # Statistical Removal (Snow/Dust)
@@ -130,20 +133,15 @@ def background_processor():
                 valid = (xi >= 0) & (xi < x_bins) & (yi >= 0) & (yi < y_bins)
                 xi, yi = xi[valid], yi[valid]
 
-                # Intensity Mapping
-                bev[yi, xi] = 1.0  # Binary occupancy for clearer shape
+                # Intensity Mapping (Binary occupancy for clearer shape)
+                bev[yi, xi] = 1.0
 
                 # Convert to Image
                 bev_img = (bev * 255).astype(np.uint8)
                 bev_img = np.flipud(bev_img)
 
-                # [FIX 2] Gap Filling (Dilation)
-                # Stretches pixels horizontally to connect the "Barcode" lines
-                # Kernel is (Height=1, Width=5) -> Horizontal stretch only
-                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 1))
-                bev_img = cv2.dilate(bev_img, kernel, iterations=2)
-
-                # Smooth edges
+                # [REVERTED] Dilation Removed.
+                # Only standard smoothing is applied.
                 bev_img = cv2.GaussianBlur(bev_img, (3, 3), 0)
 
                 cv2.imwrite(f"{folder}/side_view_image.png", bev_img)
@@ -157,11 +155,11 @@ def background_processor():
 
 
 # =====================================================
-# MAIN CLASS
+# MAIN CLASS (THREADED READER)
 # =====================================================
 class TollPlazaSystem:
     def __init__(self):
-        # [FIX 3] Threaded Serial Reader Setup
+        # Setup Serial
         try:
             self.ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
             self.ser.reset_input_buffer()
@@ -178,10 +176,13 @@ class TollPlazaSystem:
         self.current_extracted = []
         self.last_detection_time = time.time()
         self.start_capture_time = None
-        self.consecutive_triggers = 0  # [FIX 4] Persistence Counter
-        self.pre_trigger_buffer = []  # To save the frames *before* trigger confirmed
 
-    # -------------------------------------------------
+        # [FIX 4] Persistence Counters
+        self.consecutive_triggers = 0
+        self.pre_trigger_buffer = []
+
+        # -------------------------------------------------
+
     # THREAD 1: SERIAL READER (High Speed)
     # -------------------------------------------------
     def serial_worker(self):
@@ -191,7 +192,7 @@ class TollPlazaSystem:
         while self.running:
             try:
                 if self.ser.in_waiting > 0:
-                    # Read large chunks (up to 4KB) at once
+                    # Read large chunks (up to 4KB) to avoid CPU bottleneck
                     chunk = self.ser.read(min(self.ser.in_waiting, 4096))
                     internal_buffer.extend(chunk)
                 else:
@@ -222,7 +223,7 @@ class TollPlazaSystem:
                     # Extract Payload
                     body = packet[6:-2]
                     if len(body) >= 2 and struct.unpack('<H', body[:2])[0] == 50011:
-                        # Push raw body to main loop
+                        # Push raw body to main loop queue
                         frame_queue.put(body[3:])
 
             except Exception as e:
@@ -247,15 +248,17 @@ class TollPlazaSystem:
     # -------------------------------------------------
     def calibrate(self):
         print(f"⌛ Robust Calibration ({CALIBRATION_FRAMES} frames)...")
-        while not frame_queue.empty(): frame_queue.get()  # Flush old data
+        # Flush old data
+        while not frame_queue.empty(): frame_queue.get()
 
         frames = 0
         beam_history = {}
 
         while frames < CALIBRATION_FRAMES:
             try:
+                # Read from Queue (filled by thread)
                 raw_data = frame_queue.get(timeout=1.0)
-                data = raw_data  # It's already the body bytes
+                data = raw_data
                 for i in range(len(data) // 2):
                     d = struct.unpack('<H', data[i * 2:i * 2 + 2])[0]
                     if d > 0:
@@ -279,7 +282,8 @@ class TollPlazaSystem:
 
             ix, iy = int(np.floor(x / GRID_CELL_SIZE)), int(np.floor(y / GRID_CELL_SIZE))
 
-            # [FIX 5] Dilation: Mark cell AND neighbors as background
+            # [FIX 5] Background Dilation
+            # Prevents "Edge Jitter" false alarms
             for dx in [-1, 0, 1]:
                 for dy in [-1, 0, 1]:
                     self.background_matrix.add((ix + dx, iy + dy))
@@ -294,13 +298,13 @@ class TollPlazaSystem:
         threading.Thread(target=background_processor, daemon=True).start()
         threading.Thread(target=self.serial_worker, daemon=True).start()
 
-        # Allow serial to settle
         time.sleep(1.0)
         self.calibrate()
         print("🚀 System Live (Persistence Mode Enabled)")
 
         while True:
             try:
+                # Get latest frame from queue
                 raw_data = frame_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
@@ -308,7 +312,7 @@ class TollPlazaSystem:
             # Parse
             raw_xy = self.parse_raw_bytes_to_xy(raw_data)
 
-            # Calculate Z (Time dimension)
+            # Z Calculation
             t = time.time()
             if self.is_stacking:
                 z = (t - self.start_capture_time) * VEHICLE_SPEED_MPS
@@ -322,7 +326,7 @@ class TollPlazaSystem:
             for p in raw_xy:
                 ix, iy = int(np.floor(p[0] / GRID_CELL_SIZE)), int(np.floor(p[1] / GRID_CELL_SIZE))
 
-                # Check neighbors (Robust Background Check)
+                # Robust Background Check
                 is_background = False
                 for dx in [-1, 0, 1]:
                     for dy in [-1, 0, 1]:
@@ -335,31 +339,29 @@ class TollPlazaSystem:
                     extracted.append([p[0], p[1], z])
 
             # =========================================
-            # [FIX 1 Logic] PERSISTENCE CHECK
+            # [FIX 6] PERSISTENCE CHECK LOGIC
             # =========================================
             if len(extracted) > TRIGGER_THRESHOLD:
                 # Potential Object Detected
                 self.consecutive_triggers += 1
 
-                # Buffer this frame so we don't lose the start of the car
+                # Buffer this frame so we don't lose the front of the car
                 self.pre_trigger_buffer.append((raw_xyz, extracted))
                 if len(self.pre_trigger_buffer) > 10:
-                    self.pre_trigger_buffer.pop(0)  # Keep buffer small
+                    self.pre_trigger_buffer.pop(0)
 
-                # Only START if we see it for N consecutive frames
+                # Only START recording if we see it for N consecutive frames
                 if self.consecutive_triggers >= REQUIRED_PERSISTENCE:
                     if not self.is_stacking:
                         print("🚗 Vehicle Confirmed (Persistence Met)")
                         self.is_stacking = True
-                        self.start_capture_time = time.time() - (
-                                    0.02 * len(self.pre_trigger_buffer))  # Adjust start time back
+                        # Backdate start time to include the buffer
+                        self.start_capture_time = time.time() - (0.02 * len(self.pre_trigger_buffer))
                         self.current_full_stack = []
                         self.current_extracted = []
 
-                        # Add the buffered frames that happened before confirmation
+                        # Add buffered frames
                         for b_xyz, b_ext in self.pre_trigger_buffer:
-                            # Re-adjust Z for buffered frames
-                            # (Simplified: just add them, precise Z correction is minor here)
                             self.current_full_stack.extend(b_xyz)
                             self.current_extracted.extend(b_ext)
                         self.pre_trigger_buffer = []
@@ -371,10 +373,10 @@ class TollPlazaSystem:
 
             else:
                 # No object seen in this frame
-                self.consecutive_triggers = 0  # Reset persistence counter
-                self.pre_trigger_buffer = []  # Clear buffer
+                self.consecutive_triggers = 0
+                self.pre_trigger_buffer = []
 
-                # If we were recording, check for timeout
+                # If recording, check for timeout (End of Vehicle)
                 if self.is_stacking and (time.time() - self.last_detection_time > IDLE_TIMEOUT):
                     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                     processing_queue.put((list(self.current_extracted), ts))
