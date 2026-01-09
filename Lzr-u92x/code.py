@@ -23,11 +23,11 @@ START_ANGLE = -48.0
 ANGULAR_RES = 0.3516
 
 # [FIX 1] Increased Minimum Range to ignore dust on lens
-MIN_RANGE_M = 0.50
-MAX_RANGE_M = 4.0  # Extended slightly for road width
+MIN_RANGE_M = 0.15
+MAX_RANGE_M = 2.5  # Extended slightly for road width
 
 # Calibration
-CALIBRATION_FRAMES = 4500
+CALIBRATION_FRAMES = 2000
 GRID_CELL_SIZE = 0.05
 MAX_NEIGHBOR_JUMP = 0.15
 
