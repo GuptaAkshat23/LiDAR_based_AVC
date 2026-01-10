@@ -42,11 +42,23 @@ TRIGGER_THRESHOLD = 40  # Ignores small noise clusters
 REQUIRED_PERSISTENCE = 5  # Object must be seen in 5 frames to confirm
 IDLE_TIMEOUT = 0.5  # Faster cutoff for road traffic
 
-# Image Generation Parameters
+# -----------------------------------------------------
+# NEW IMAGE GENERATION PARAMETERS (From image_generator.py)
+# -----------------------------------------------------
+GRID_RES = 0.01  # meters per pixel (Updated from 0.005)
+EDGE_MARGIN = 0.10  # meters
+ROTATION_ANGLE_X = 40.0  # Angle in degrees to rotate around X-axis
+
+# Contrast & Color
+CONTRAST_GAMMA = 1.0  # 1.0 = Natural, 2.0 = High Contrast
+MIN_BRIGHTNESS = 0.3  # 0.3 = Dark Grey points
+BLACK_POINT_PCT = 2
+WHITE_POINT_PCT = 98
+BACKGROUND_COLOR = 0  # 0 = Black
+
+# (Old Image Params - Kept only if needed by other parts, but mostly replaced)
 X_IMG_RANGE = (-1, 1)
 Y_IMG_RANGE = (-1, 1)
-GRID_RES = 0.005  # 5mm per pixel
-MAX_DIST_INTENSITY = 50.0
 
 # Global Queues
 # frame_queue: Raw data from Serial Thread -> Main Loop
@@ -105,46 +117,84 @@ def background_processor():
                 processing_queue.task_done();
                 continue
 
-            # 2. Save Side View PCD
-            # Rotate: Look from side
-            R = np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]], dtype=np.float64)
-            pts_side = (R @ np.asarray(pcd.points).T).T
+            # 2. Save Side View PCD (Legacy / Original Logic)
+            # This preserves the original .pcd file saving logic exactly as requested.
+            R_old = np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]], dtype=np.float64)
+            pts_side = (R_old @ np.asarray(pcd.points).T).T
 
             pcd_side = o3d.geometry.PointCloud()
             pcd_side.points = o3d.utility.Vector3dVector(pts_side)
             o3d.io.write_point_cloud(f"{folder}/side_view.pcd", pcd_side)
 
-            # 3. Generate Image
-            mask = (
-                    (pts_side[:, 0] >= X_IMG_RANGE[0]) & (pts_side[:, 0] <= X_IMG_RANGE[1]) &
-                    (pts_side[:, 1] >= Y_IMG_RANGE[0]) & (pts_side[:, 1] <= Y_IMG_RANGE[1])
-            )
-            img_points = pts_side[mask]
+            # 3. Generate Image (UPDATED with logic from image_generator.py)
+            # =============================================================
 
-            if len(img_points) > 0:
-                x_bins = int((X_IMG_RANGE[1] - X_IMG_RANGE[0]) / GRID_RES)
-                y_bins = int((Y_IMG_RANGE[1] - Y_IMG_RANGE[0]) / GRID_RES)
-                bev = np.zeros((y_bins, x_bins), dtype=np.float32)
+            # Use the cleaned 'pcd' (not pcd_side) as the source
+            # Apply Rotation (X-Axis)
+            if ROTATION_ANGLE_X != 0:
+                angle_rad = np.radians(ROTATION_ANGLE_X)
+                # Create Rotation Matrix for X-axis: (angle, 0, 0)
+                R_new = pcd.get_rotation_matrix_from_xyz((angle_rad, 0, 0))
+                pcd.rotate(R_new, center=(0, 0, 0))
 
-                # Map points to grid
-                xi = ((img_points[:, 0] - X_IMG_RANGE[0]) / GRID_RES).astype(np.int32)
-                yi = ((img_points[:, 1] - Y_IMG_RANGE[0]) / GRID_RES).astype(np.int32)
+            # Convert to NumPy
+            points = np.asarray(pcd.points)
+            if len(points) == 0:
+                processing_queue.task_done()
+                continue
 
-                valid = (xi >= 0) & (xi < x_bins) & (yi >= 0) & (yi < y_bins)
-                xi, yi = xi[valid], yi[valid]
+            # Depth Calculation
+            depth_values = points[:, 2]  # Assuming Z is depth
+            min_depth = np.percentile(depth_values, BLACK_POINT_PCT)
+            max_depth = np.percentile(depth_values, WHITE_POINT_PCT)
+            depth_range = max_depth - min_depth
+            if depth_range < 1e-6: depth_range = 1.0
 
-                # Intensity Mapping (Binary occupancy for clearer shape)
-                bev[yi, xi] = 1.0
+            # Frame Setup
+            min_x, max_x = points[:, 0].min(), points[:, 0].max()
+            min_y, max_y = points[:, 1].min(), points[:, 1].max()
 
-                # Convert to Image
-                bev_img = (bev * 255).astype(np.uint8)
-                bev_img = np.flipud(bev_img)
+            min_x -= EDGE_MARGIN
+            max_x += EDGE_MARGIN
+            min_y -= EDGE_MARGIN
+            max_y += EDGE_MARGIN
 
-                # [REVERTED] Dilation Removed.
-                # Only standard smoothing is applied.
-                bev_img = cv2.GaussianBlur(bev_img, (3, 3), 0)
+            x_bins = int(np.ceil((max_x - min_x) / GRID_RES))
+            y_bins = int(np.ceil((max_y - min_y) / GRID_RES))
 
-                cv2.imwrite(f"{folder}/side_view_image.png", bev_img)
+            # Initialize grid
+            bev = np.full((y_bins, x_bins), -1.0, dtype=np.float32)
+
+            # Project Points
+            xi_arr = ((points[:, 0] - min_x) / GRID_RES).astype(np.int32)
+            yi_arr = ((points[:, 1] - min_y) / GRID_RES).astype(np.int32)
+            valid_mask = (xi_arr >= 0) & (xi_arr < x_bins) & (yi_arr >= 0) & (yi_arr < y_bins)
+
+            # Normalize & Brightness Logic
+            norm_depths = (depth_values - min_depth) / depth_range
+            norm_depths = np.clip(norm_depths, 0.0, 1.0)
+            norm_depths = np.power(norm_depths, CONTRAST_GAMMA)
+
+            # Apply Grey Scale lift
+            norm_depths = MIN_BRIGHTNESS + (norm_depths * (1.0 - MIN_BRIGHTNESS))
+
+            # Fill Grid (Max projection)
+            for i in np.where(valid_mask)[0]:
+                xi, yi = xi_arr[i], yi_arr[i]
+                val = norm_depths[i]
+                if val > bev[yi, xi]:
+                    bev[yi, xi] = val
+
+            # Image Generation
+            bg_norm = BACKGROUND_COLOR / 255.0
+            bev[bev == -1] = bg_norm
+
+            bev_uint8 = (bev * 255).astype(np.uint8)
+            bev_final = np.flipud(bev_uint8)
+
+            # Save the new image
+            output_image_path = f"{folder}/side_view_image.png"
+            cv2.imwrite(output_image_path, bev_final)
 
             print(f"✅ Vehicle {ts} Saved")
             processing_queue.task_done()
