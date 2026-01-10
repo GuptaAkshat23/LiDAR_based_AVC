@@ -33,7 +33,7 @@ MAX_NEIGHBOR_JUMP = 0.15
 
 # Physics (Speed)
 # [FIX 2] Updated to 25 km/h to match road conditions
-VEHICLE_SPEED_KMPH = 25.0
+VEHICLE_SPEED_KMPH = 5
 VEHICLE_SPEED_MPS = VEHICLE_SPEED_KMPH / 3.6
 
 # Detection Logic
