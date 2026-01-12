@@ -265,3 +265,5 @@ class TollPlazaSystem:
 
 
 if __name__ == "__main__":
+    system = TollPlazaSystem()
+    system.run_forever()
