@@ -15,7 +15,7 @@ import sys
 # CONFIGURATION
 # =====================================================
 # Hardware
-SERIAL_PORT = '/dev/ttyUSB0'  # Adjust for your Pi
+SERIAL_PORT = 'COM9'  # Adjust for your Pi
 BAUD_RATE = 921600
 
 # Sensor Geometry
@@ -23,17 +23,17 @@ START_ANGLE = -48.0
 ANGULAR_RES = 0.3516
 
 # [FIX 1] Increased Minimum Range to ignore dust on lens
-MIN_RANGE_M = 0.15
-MAX_RANGE_M = 2.25  # Extended slightly for road width
+MIN_RANGE_M = 0.50
+MAX_RANGE_M = 4.0  # Extended slightly for road width
 
 # Calibration
-CALIBRATION_FRAMES = 3000
+CALIBRATION_FRAMES = 4500
 GRID_CELL_SIZE = 0.05
 MAX_NEIGHBOR_JUMP = 0.15
 
 # Physics (Speed)
 # [FIX 2] Updated to 25 km/h to match road conditions
-VEHICLE_SPEED_KMPH = 5
+VEHICLE_SPEED_KMPH = 25.0
 VEHICLE_SPEED_MPS = VEHICLE_SPEED_KMPH / 3.6
 
 # Detection Logic
@@ -43,8 +43,8 @@ REQUIRED_PERSISTENCE = 5  # Object must be seen in 5 frames to confirm
 IDLE_TIMEOUT = 0.5  # Faster cutoff for road traffic
 
 # Image Generation Parameters
-X_IMG_RANGE = (-2, 4)
-Y_IMG_RANGE = (-2, 4)
+X_IMG_RANGE = (-1, 1)
+Y_IMG_RANGE = (-1, 1)
 GRID_RES = 0.005  # 5mm per pixel
 MAX_DIST_INTENSITY = 50.0
 

@@ -9,61 +9,46 @@ import queue
 import os
 from datetime import datetime
 import statistics
-import sys
 
 # =====================================================
 # CONFIGURATION
 # =====================================================
-# Hardware
-SERIAL_PORT = 'COM9'  # Adjust for your Pi
+SERIAL_PORT = '/dev/ttyUSB0'  # Change to '/dev/ttyUSB0' or '/dev/ttyACM0' for RPi
 BAUD_RATE = 921600
 
-# Sensor Geometry
+# Sensor Properties
 START_ANGLE = -48.0
 ANGULAR_RES = 0.3516
 
-# [FIX 1] Increased Minimum Range to ignore dust on lens
-MIN_RANGE_M = 0.15
-MAX_RANGE_M = 2.25  # Extended slightly for road width
+# Calibration / Background Subtraction
+CALIBRATION_FRAMES = 3000
+GRID_CELL_SIZE = 0.05  # Size of background grid cells (meters)
 
-# Calibration
-CALIBRATION_FRAMES = 2000
-GRID_CELL_SIZE = 0.05
+# Filtering Limits
+MIN_RANGE_M = 0.10
+MAX_RANGE_M = 2.25
 MAX_NEIGHBOR_JUMP = 0.15
 
-# Physics (Speed)
-# [FIX 2] Updated to 25 km/h to match road conditions
+# Vehicle Logic
 VEHICLE_SPEED_KMPH = 5
 VEHICLE_SPEED_MPS = VEHICLE_SPEED_KMPH / 3.6
+TRIGGER_THRESHOLD = 50  # Minimum points to consider it a vehicle
+IDLE_TIMEOUT = 0.8  # Seconds of silence to consider vehicle passed
 
-# Detection Logic
-# [FIX 3] Stricter thresholds to stop ghost detections
-TRIGGER_THRESHOLD = 40  # Ignores small noise clusters
-REQUIRED_PERSISTENCE = 5  # Object must be seen in 5 frames to confirm
-IDLE_TIMEOUT = 0.5  # Faster cutoff for road traffic
+# --- Image Generation Parameters ---
+GRID_RES = 0.005  # 5mm per pixel resolution
+MAX_DIST_INTENSITY = 50.0
 
-# -----------------------------------------------------
-# NEW IMAGE GENERATION PARAMETERS (From image_generator.py)
-# -----------------------------------------------------
-GRID_RES = 0.01  # meters per pixel (Updated from 0.005)
-EDGE_MARGIN = 0.10  # meters
-ROTATION_ANGLE_X = 40.0  # Angle in degrees to rotate around X-axis
+# [NEW] 3D Rotation Correction (Degrees)
+# Adjust these values to compensate for physical mounting angles
+ROTATION_X_DEG = 20.0  # Pitch (Tilt forward/backward)
+ROTATION_Y_DEG = 0.0  # Roll  (Tilt left/right)
+ROTATION_Z_DEG = 0.0  # Yaw   (Spin rotation)
 
-# Contrast & Color
-CONTRAST_GAMMA = 1.0  # 1.0 = Natural, 2.0 = High Contrast
-MIN_BRIGHTNESS = 0.3  # 0.3 = Dark Grey points
-BLACK_POINT_PCT = 2
-WHITE_POINT_PCT = 98
-BACKGROUND_COLOR = 0  # 0 = Black
+# [NEW] Dynamic Frame Settings
+FRAME_PADDING_M = 0.2  # Add 20cm empty space around the vehicle crop
+MIN_IMAGE_DIM_M = 1.0  # Minimum image size (meters) to prevent errors on noise
 
-# (Old Image Params - Kept only if needed by other parts, but mostly replaced)
-X_IMG_RANGE = (-1, 1)
-Y_IMG_RANGE = (-1, 1)
-
-# Global Queues
-# frame_queue: Raw data from Serial Thread -> Main Loop
-# processing_queue: Extracted Object -> Image Generator Thread
-frame_queue = queue.Queue()
 processing_queue = queue.Queue()
 
 
@@ -71,6 +56,7 @@ processing_queue = queue.Queue()
 # HELPER: ROBUST MEDIAN (MAD)
 # =====================================================
 def robust_median(distances):
+    """Calculates median ignoring outliers using Median Absolute Deviation."""
     if len(distances) < 5:
         return None
     median = statistics.median(distances)
@@ -83,7 +69,7 @@ def robust_median(distances):
 
 
 # =====================================================
-# WORKER: BACKGROUND IMAGE PROCESSOR
+# BACKGROUND PROCESSOR (3D ROTATION + DYNAMIC SIZE)
 # =====================================================
 def background_processor():
     print("🧵 Background Processor Started")
@@ -91,7 +77,7 @@ def background_processor():
         try:
             extracted_stack, ts = processing_queue.get()
 
-            # Safety Check: Too few points crash Open3D
+            # Safety Check: Ensure enough points exist for statistical analysis
             if len(extracted_stack) < 30:
                 print(f"⚠️ Vehicle {ts} Skipped: Too few points ({len(extracted_stack)})")
                 processing_queue.task_done()
@@ -100,343 +86,288 @@ def background_processor():
             folder = f"vehicle_{ts}"
             os.makedirs(folder, exist_ok=True)
 
-            # 1. Point Cloud Cleaning
+            # ---------------------------------------------------------
+            # 1. Cleaning (Statistical Outlier Removal)
+            # ---------------------------------------------------------
             pcd = o3d.geometry.PointCloud()
-            # Force float64 for RPi stability
+            # Force float64 for stability on ARM (Raspberry Pi)
             pcd.points = o3d.utility.Vector3dVector(np.array(extracted_stack, dtype=np.float64))
 
-            # Statistical Removal (Snow/Dust)
             pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=25, std_ratio=0.8)
             if len(pcd.points) == 0:
-                processing_queue.task_done();
+                print(f"⚠️ Vehicle {ts} Skipped: Empty after statistical cleanup")
+                processing_queue.task_done()
                 continue
 
-            # Radius Removal (Flying Pixels)
             pcd, _ = pcd.remove_radius_outlier(nb_points=12, radius=0.06)
             if len(pcd.points) == 0:
-                processing_queue.task_done();
+                print(f"⚠️ Vehicle {ts} Skipped: Empty after radius cleanup")
+                processing_queue.task_done()
                 continue
 
-            # 2. Save Side View PCD (Legacy / Original Logic)
-            # This preserves the original .pcd file saving logic exactly as requested.
-            R_old = np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]], dtype=np.float64)
-            pts_side = (R_old @ np.asarray(pcd.points).T).T
+            # ---------------------------------------------------------
+            # 2. Standard Side View Transformation
+            # ---------------------------------------------------------
+            # Map raw Lidar data to Side View:
+            # Old Z (Time) -> New X (Length)
+            # Old Y (Height) -> New Y (Height)
+            # -Old X -> New Z (Depth)
+            R_standard = np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]], dtype=np.float64)
+            pts_side = (R_standard @ np.asarray(pcd.points).T).T
 
+            # ---------------------------------------------------------
+            # [NEW] 2.1 Apply Full 3D Mounting Rotation Correction
+            # ---------------------------------------------------------
+            # We construct a rotation matrix R_total = Rz * Ry * Rx
+            rad_x = np.radians(ROTATION_X_DEG)
+            rad_y = np.radians(ROTATION_Y_DEG)
+            rad_z = np.radians(ROTATION_Z_DEG)
+
+            # Pitch (X)
+            Rx = np.array([
+                [1, 0, 0],
+                [0, np.cos(rad_x), -np.sin(rad_x)],
+                [0, np.sin(rad_x), np.cos(rad_x)]
+            ])
+
+            # Roll (Y)
+            Ry = np.array([
+                [np.cos(rad_y), 0, np.sin(rad_y)],
+                [0, 1, 0],
+                [-np.sin(rad_y), 0, np.cos(rad_y)]
+            ])
+
+            # Yaw (Z)
+            Rz = np.array([
+                [np.cos(rad_z), -np.sin(rad_z), 0],
+                [np.sin(rad_z), np.cos(rad_z), 0],
+                [0, 0, 1]
+            ])
+
+            # Combined Rotation
+            R_total = Rz @ Ry @ Rx
+
+            # Apply rotation to all points
+            pts_side = (R_total @ pts_side.T).T
+
+            # Save Side View PCD (Rotated)
             pcd_side = o3d.geometry.PointCloud()
             pcd_side.points = o3d.utility.Vector3dVector(pts_side)
             o3d.io.write_point_cloud(f"{folder}/side_view.pcd", pcd_side)
 
-            # 3. Generate Image (UPDATED with logic from image_generator.py)
-            # =============================================================
+            # ---------------------------------------------------------
+            # [NEW] 3. Dynamic Frame Calculation
+            # ---------------------------------------------------------
+            # Find the min/max boundaries of the actual vehicle points
+            min_x, min_y = np.min(pts_side[:, :2], axis=0)
+            max_x, max_y = np.max(pts_side[:, :2], axis=0)
 
-            # Use the cleaned 'pcd' (not pcd_side) as the source
-            # Apply Rotation (X-Axis)
-            if ROTATION_ANGLE_X != 0:
-                angle_rad = np.radians(ROTATION_ANGLE_X)
-                # Create Rotation Matrix for X-axis: (angle, 0, 0)
-                R_new = pcd.get_rotation_matrix_from_xyz((angle_rad, 0, 0))
-                pcd.rotate(R_new, center=(0, 0, 0))
+            # Apply Padding
+            min_x -= FRAME_PADDING_M
+            max_x += FRAME_PADDING_M
+            min_y -= FRAME_PADDING_M
+            max_y += FRAME_PADDING_M
 
-            # Convert to NumPy
-            points = np.asarray(pcd.points)
-            if len(points) == 0:
-                processing_queue.task_done()
-                continue
+            # Ensure minimum frame size (prevents crash on tiny artifacts)
+            if (max_x - min_x) < MIN_IMAGE_DIM_M: max_x = min_x + MIN_IMAGE_DIM_M
+            if (max_y - min_y) < MIN_IMAGE_DIM_M: max_y = min_y + MIN_IMAGE_DIM_M
 
-            # Depth Calculation
-            depth_values = points[:, 2]  # Assuming Z is depth
-            min_depth = np.percentile(depth_values, BLACK_POINT_PCT)
-            max_depth = np.percentile(depth_values, WHITE_POINT_PCT)
-            depth_range = max_depth - min_depth
-            if depth_range < 1e-6: depth_range = 1.0
+            # Calculate dynamic image resolution (pixels)
+            width_m = max_x - min_x
+            height_m = max_y - min_y
 
-            # Frame Setup
-            min_x, max_x = points[:, 0].min(), points[:, 0].max()
-            min_y, max_y = points[:, 1].min(), points[:, 1].max()
+            x_bins = int(width_m / GRID_RES)
+            y_bins = int(height_m / GRID_RES)
 
-            min_x -= EDGE_MARGIN
-            max_x += EDGE_MARGIN
-            min_y -= EDGE_MARGIN
-            max_y += EDGE_MARGIN
+            # ---------------------------------------------------------
+            # 4. Image Generation
+            # ---------------------------------------------------------
+            bev = np.zeros((y_bins, x_bins), dtype=np.float32)
 
-            x_bins = int(np.ceil((max_x - min_x) / GRID_RES))
-            y_bins = int(np.ceil((max_y - min_y) / GRID_RES))
+            # Vectorized projection relative to the dynamic origin (min_x, min_y)
+            xi = ((pts_side[:, 0] - min_x) / GRID_RES).astype(np.int32)
+            yi = ((pts_side[:, 1] - min_y) / GRID_RES).astype(np.int32)
 
-            # Initialize grid
-            bev = np.full((y_bins, x_bins), -1.0, dtype=np.float32)
+            # Filter valid indices within the new dynamic grid
+            valid_indices = (xi >= 0) & (xi < x_bins) & (yi >= 0) & (yi < y_bins)
+            xi = xi[valid_indices]
+            yi = yi[valid_indices]
+            v_points = pts_side[valid_indices]
 
-            # Project Points
-            xi_arr = ((points[:, 0] - min_x) / GRID_RES).astype(np.int32)
-            yi_arr = ((points[:, 1] - min_y) / GRID_RES).astype(np.int32)
-            valid_mask = (xi_arr >= 0) & (xi_arr < x_bins) & (yi_arr >= 0) & (yi_arr < y_bins)
+            if len(v_points) > 0:
+                # Intensity based on distance (depth)
+                dist = np.sqrt(v_points[:, 0] ** 2 + v_points[:, 1] ** 2)
+                intensity = 1.0 - np.minimum(dist / MAX_DIST_INTENSITY, 1.0)
 
-            # Normalize & Brightness Logic
-            norm_depths = (depth_values - min_depth) / depth_range
-            norm_depths = np.clip(norm_depths, 0.0, 1.0)
-            norm_depths = np.power(norm_depths, CONTRAST_GAMMA)
+                # Assign to grid (Last point writes wins)
+                bev[yi, xi] = intensity
 
-            # Apply Grey Scale lift
-            norm_depths = MIN_BRIGHTNESS + (norm_depths * (1.0 - MIN_BRIGHTNESS))
+                # Final Image Processing
+                bev_img = (bev * 255).astype(np.uint8)
+                bev_img = np.flipud(bev_img)  # Flip Y so ground is at bottom
+                bev_img = cv2.GaussianBlur(bev_img, (3, 3), 0)
 
-            # Fill Grid (Max projection)
-            for i in np.where(valid_mask)[0]:
-                xi, yi = xi_arr[i], yi_arr[i]
-                val = norm_depths[i]
-                if val > bev[yi, xi]:
-                    bev[yi, xi] = val
+                img_path = f"{folder}/side_view_image.png"
+                cv2.imwrite(img_path, bev_img)
+                print(f"✅ Vehicle {ts} Processed: {x_bins}x{y_bins} px -> {img_path}")
+            else:
+                print(f"⚠️ Vehicle {ts} Skipped: No points in generated frame")
 
-            # Image Generation
-            bg_norm = BACKGROUND_COLOR / 255.0
-            bev[bev == -1] = bg_norm
-
-            bev_uint8 = (bev * 255).astype(np.uint8)
-            bev_final = np.flipud(bev_uint8)
-
-            # Save the new image
-            output_image_path = f"{folder}/side_view_image.png"
-            cv2.imwrite(output_image_path, bev_final)
-
-            print(f"✅ Vehicle {ts} Saved")
             processing_queue.task_done()
 
         except Exception as e:
-            print(f"❌ Error in Image Proc: {e}")
+            print(f"❌ Error in background processor: {e}")
+            import traceback
+            traceback.print_exc()
             processing_queue.task_done()
 
 
 # =====================================================
-# MAIN CLASS (THREADED READER)
+# MAIN SYSTEM
 # =====================================================
 class TollPlazaSystem:
     def __init__(self):
-        # Setup Serial
         try:
             self.ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
-            self.ser.reset_input_buffer()
-        except Exception as e:
-            print(f"❌ Serial Port Error: {e}")
-            sys.exit(1)
+        except serial.SerialException as e:
+            print(f"❌ Serial Error: {e}")
+            print("Check connection and permissions (sudo chmod 666 /dev/ttyUSB0)")
+            exit(1)
 
         self.background_matrix = set()
-        self.running = True
-
-        # Detection State
         self.is_stacking = False
         self.current_full_stack = []
         self.current_extracted = []
         self.last_detection_time = time.time()
         self.start_capture_time = None
 
-        # [FIX 4] Persistence Counters
-        self.consecutive_triggers = 0
-        self.pre_trigger_buffer = []
-
-        # -------------------------------------------------
-
-    # THREAD 1: SERIAL READER (High Speed)
-    # -------------------------------------------------
-    def serial_worker(self):
-        print("⚡ Serial Worker Thread Live")
-        internal_buffer = bytearray()
-
-        while self.running:
-            try:
-                if self.ser.in_waiting > 0:
-                    # Read large chunks (up to 4KB) to avoid CPU bottleneck
-                    chunk = self.ser.read(min(self.ser.in_waiting, 4096))
-                    internal_buffer.extend(chunk)
-                else:
-                    time.sleep(0.001)
-                    continue
-
-                # Parse Buffer for Packets
-                while len(internal_buffer) > 8:
-                    header_idx = internal_buffer.find(b'\xfc\xfd\xfe\xff')
-
-                    if header_idx == -1:
-                        internal_buffer = internal_buffer[-3:]
-                        break
-
-                    if header_idx > 0:
-                        internal_buffer = internal_buffer[header_idx:]
-
-                    if len(internal_buffer) < 6: break
-
-                    size = struct.unpack('<H', internal_buffer[4:6])[0]
-                    total_len = 4 + 2 + size + 2
-
-                    if len(internal_buffer) < total_len: break
-
-                    packet = internal_buffer[:total_len]
-                    internal_buffer = internal_buffer[total_len:]
-
-                    # Extract Payload
-                    body = packet[6:-2]
-                    if len(body) >= 2 and struct.unpack('<H', body[:2])[0] == 50011:
-                        # Push raw body to main loop queue
-                        frame_queue.put(body[3:])
-
-            except Exception as e:
-                print(f"❌ Serial Error: {e}")
-                time.sleep(1)
-
-    # -------------------------------------------------
-    # HELPER: PARSE BYTES
-    # -------------------------------------------------
-    def parse_raw_bytes_to_xy(self, data):
-        pts = []
-        for i in range(len(data) // 2):
-            d_mm = struct.unpack('<H', data[i * 2:i * 2 + 2])[0]
-            if 100 < d_mm < 3500:  # Filter 10cm to 3.5m
-                dist = d_mm / 1000.0
-                ang = np.radians(START_ANGLE + i * ANGULAR_RES)
-                pts.append([dist * np.cos(ang), dist * np.sin(ang)])
-        return pts
-
-    # -------------------------------------------------
-    # CALIBRATION
-    # -------------------------------------------------
     def calibrate(self):
-        print(f"⌛ Robust Calibration ({CALIBRATION_FRAMES} frames)...")
-        # Flush old data
-        while not frame_queue.empty(): frame_queue.get()
-
-        frames = 0
+        print(f"⌛ Robust Zero Plane Training ({CALIBRATION_FRAMES} frames)...")
+        os.makedirs("calibration", exist_ok=True)
         beam_history = {}
+        frames = 0
 
         while frames < CALIBRATION_FRAMES:
-            try:
-                # Read from Queue (filled by thread)
-                raw_data = frame_queue.get(timeout=1.0)
-                data = raw_data
-                for i in range(len(data) // 2):
-                    d = struct.unpack('<H', data[i * 2:i * 2 + 2])[0]
-                    if d > 0:
-                        beam_history.setdefault(i, []).append(d)
-                frames += 1
-                if frames % 500 == 0: print(f"    {frames}/{CALIBRATION_FRAMES}")
-            except queue.Empty:
-                continue
+            # Read header
+            if self.ser.read(1) == b'\xfc' and self.ser.read(3) == b'\xfd\xfe\xff':
+                size_bytes = self.ser.read(2)
+                if len(size_bytes) < 2: continue
+                size = struct.unpack('<H', size_bytes)[0]
 
-        print("    Computing Median & Dilating...")
+                body = self.ser.read(size)
+                if len(body) < size: continue
+
+                # Checksum/Footer skip
+                self.ser.read(2)
+
+                # Verify Message ID (50011 for LZR-U921 specific output)
+                if len(body) > 2 and struct.unpack('<H', body[:2])[0] == 50011:
+                    data = body[3:]
+                    for i in range(len(data) // 2):
+                        d = struct.unpack('<H', data[i * 2:i * 2 + 2])[0]
+                        if d > 0:
+                            beam_history.setdefault(i, []).append(d)
+                    frames += 1
+                    if frames % 500 == 0:
+                        print(f"    Frames: {frames}/{CALIBRATION_FRAMES}")
+
+        # Process Calibration Data
+        clean_zero_pts = []
         idxs = sorted(beam_history.keys())
-        for idx in idxs:
+        for j, idx in enumerate(idxs):
             robust_mm = robust_median(beam_history[idx])
             if robust_mm is None: continue
-            dist_m = robust_mm / 1000.0
 
+            dist_m = robust_mm / 1000.0
             if not (MIN_RANGE_M <= dist_m <= MAX_RANGE_M): continue
 
             angle = np.radians(START_ANGLE + idx * ANGULAR_RES)
             x, y = dist_m * np.cos(angle), dist_m * np.sin(angle)
+            clean_zero_pts.append((x, y, 0.0))
 
+            # Add to background set
             ix, iy = int(np.floor(x / GRID_CELL_SIZE)), int(np.floor(y / GRID_CELL_SIZE))
+            self.background_matrix.add((ix, iy))
 
-            # [FIX 5] Background Dilation
-            # Prevents "Edge Jitter" false alarms
-            for dx in [-1, 0, 1]:
-                for dy in [-1, 0, 1]:
-                    self.background_matrix.add((ix + dx, iy + dy))
+        # Save Calibration
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(np.array(clean_zero_pts))
+        o3d.io.write_point_cloud("calibration/lzr_zero_plane.pcd", pcd)
+        print(f"✅ Robust Zero Plane Saved ({len(clean_zero_pts)} points)")
 
-        print(f"✅ Calibration Done. Background Cells: {len(self.background_matrix)}")
+    def get_raw_frame(self):
+        """Reads one full scan from the LiDAR."""
+        if self.ser.read(1) == b'\xfc' and self.ser.read(3) == b'\xfd\xfe\xff':
+            size_bytes = self.ser.read(2)
+            if len(size_bytes) < 2: return None
+            size = struct.unpack('<H', size_bytes)[0]
 
-    # -------------------------------------------------
-    # MAIN LOOP
-    # -------------------------------------------------
+            body = self.ser.read(size)
+            if len(body) < size: return None
+
+            self.ser.read(2)  # Checksum
+
+            if len(body) > 2 and struct.unpack('<H', body[:2])[0] == 50011:
+                data = body[3:]
+                pts = []
+                for i in range(len(data) // 2):
+                    d_mm = struct.unpack('<H', data[i * 2:i * 2 + 2])[0]
+                    # Filter valid range immediately
+                    if 100 < d_mm < 3500:
+                        dist = d_mm / 1000.0
+                        ang = np.radians(START_ANGLE + i * ANGULAR_RES)
+                        pts.append([dist * np.cos(ang), dist * np.sin(ang)])
+                return pts
+        return None
+
     def run_forever(self):
-        # Start Threads
-        threading.Thread(target=background_processor, daemon=True).start()
-        threading.Thread(target=self.serial_worker, daemon=True).start()
+        # Start the background processor in a separate thread
+        t = threading.Thread(target=background_processor, daemon=True)
+        t.start()
 
-        time.sleep(1.0)
         self.calibrate()
-        print("🚀 System Live (Persistence Mode Enabled)")
+        print("🚀 System Live - Waiting for vehicles...")
 
         while True:
-            try:
-                # Get latest frame from queue
-                raw_data = frame_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
+            raw_xy = self.get_raw_frame()
+            if not raw_xy: continue
 
-            # Parse
-            raw_xy = self.parse_raw_bytes_to_xy(raw_data)
-
-            # Z Calculation
             t = time.time()
-            if self.is_stacking:
-                z = (t - self.start_capture_time) * VEHICLE_SPEED_MPS
-            else:
-                z = 0
-
+            # Calculate Z (Time dimension) based on estimated speed
+            z = (t - self.start_capture_time) * VEHICLE_SPEED_MPS if self.is_stacking else 0
             raw_xyz = [[p[0], p[1], z] for p in raw_xy]
 
             # Background Subtraction
             extracted = []
             for p in raw_xy:
                 ix, iy = int(np.floor(p[0] / GRID_CELL_SIZE)), int(np.floor(p[1] / GRID_CELL_SIZE))
-
-                # Robust Background Check
-                is_background = False
-                for dx in [-1, 0, 1]:
-                    for dy in [-1, 0, 1]:
-                        if (ix + dx, iy + dy) in self.background_matrix:
-                            is_background = True
-                            break
-                    if is_background: break
-
-                if not is_background:
+                if (ix, iy) not in self.background_matrix:
                     extracted.append([p[0], p[1], z])
 
-            # =========================================
-            # [FIX 6] PERSISTENCE CHECK LOGIC
-            # =========================================
+            # Trigger Logic
             if len(extracted) > TRIGGER_THRESHOLD:
-                # Potential Object Detected
-                self.consecutive_triggers += 1
+                if not self.is_stacking:
+                    self.is_stacking = True
+                    self.start_capture_time = time.time()
+                    self.current_full_stack = []
+                    self.current_extracted = []
+                    print("🚗 Vehicle Detected")
 
-                # Buffer this frame so we don't lose the front of the car
-                self.pre_trigger_buffer.append((raw_xyz, extracted))
-                if len(self.pre_trigger_buffer) > 10:
-                    self.pre_trigger_buffer.pop(0)
+                self.current_full_stack.extend(raw_xyz)
+                self.current_extracted.extend(extracted)
+                self.last_detection_time = time.time()
 
-                # Only START recording if we see it for N consecutive frames
-                if self.consecutive_triggers >= REQUIRED_PERSISTENCE:
-                    if not self.is_stacking:
-                        print("🚗 Vehicle Confirmed (Persistence Met)")
-                        self.is_stacking = True
-                        # Backdate start time to include the buffer
-                        self.start_capture_time = time.time() - (0.02 * len(self.pre_trigger_buffer))
-                        self.current_full_stack = []
-                        self.current_extracted = []
+            elif self.is_stacking and (time.time() - self.last_detection_time > IDLE_TIMEOUT):
+                # Vehicle has passed
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                print(f"🏁 Vehicle {ts} queued for processing ({len(self.current_extracted)} points)")
 
-                        # Add buffered frames
-                        for b_xyz, b_ext in self.pre_trigger_buffer:
-                            self.current_full_stack.extend(b_xyz)
-                            self.current_extracted.extend(b_ext)
-                        self.pre_trigger_buffer = []
+                # Send deep copy to queue
+                processing_queue.put((list(self.current_extracted), ts))
 
-                    # Standard Recording
-                    self.current_full_stack.extend(raw_xyz)
-                    self.current_extracted.extend(extracted)
-                    self.last_detection_time = time.time()
-
-            else:
-                # No object seen in this frame
-                self.consecutive_triggers = 0
-                self.pre_trigger_buffer = []
-
-                # If recording, check for timeout (End of Vehicle)
-                if self.is_stacking and (time.time() - self.last_detection_time > IDLE_TIMEOUT):
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    processing_queue.put((list(self.current_extracted), ts))
-                    self.is_stacking = False
-                    print(f"🏁 Vehicle {ts} Finished")
+                self.is_stacking = False
 
 
 if __name__ == "__main__":
-    sys = TollPlazaSystem()
-    try:
-        sys.run_forever()
-    except KeyboardInterrupt:
-        sys.running = False
+    system = TollPlazaSystem()
+    system.run_forever()
